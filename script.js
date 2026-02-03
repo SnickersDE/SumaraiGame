@@ -3,7 +3,7 @@ const SYMBOLS = {
 };
 
 class Game {
-    constructor() {
+    constructor(options = {}) {
         this.board = Array(6).fill(null).map(() => Array(7).fill(null));
         this.currentPlayer = 1;
         this.selectedCell = null;
@@ -13,11 +13,62 @@ class Game {
         this.player1Setup = [];
         this.player2Setup = [];
         this.pendingDuel = null;
-        this.startSetupPhase();
+        this.multiplayer = options.multiplayer ?? false;
+        this.viewerPlayer = options.viewerPlayer ?? null;
+        this.sendCommand = options.sendCommand ?? null;
+        this.setupStep = null;
+        this.lastBattleSeq = null;
+        this.duelModalOpen = false;
+        if (!this.multiplayer) {
+            this.startSetupPhase();
+        }
     }
 
     startSetupPhase() {
         this.showSetupModal(1);
+    }
+
+    applyState(state) {
+        const wasGameOver = this.gameOver;
+        this.board = state.board;
+        this.currentPlayer = state.currentPlayer;
+        this.setupPhase = state.setupPhase;
+        this.setupPlayer = state.setupPlayer;
+        this.gameOver = state.gameOver;
+        this.pendingDuel = state.duel || null;
+        if (state.battleSeq !== undefined && state.battleSeq !== this.lastBattleSeq && state.lastBattle) {
+            this.lastBattleSeq = state.battleSeq;
+            this.showBattleAnimation(state.lastBattle.attacker, state.lastBattle.defender, state.lastBattle.winner, () => {});
+        }
+        if (!wasGameOver && this.gameOver && state.winner) {
+            this.endGame(state.winner);
+        }
+        if (this.multiplayer) {
+            if (!this.setupPhase || this.setupPlayer !== this.viewerPlayer) {
+                this.setupStep = null;
+            } else {
+                const hasFlag = state.flags && state.flags[this.viewerPlayer];
+                if (!hasFlag && this.setupStep !== 'flag') {
+                    this.setupStep = 'flag';
+                    this.showSetupModal(this.viewerPlayer);
+                }
+                if (hasFlag && this.setupStep !== 'assign') {
+                    this.setupStep = 'assign';
+                    this.showPieceAssignmentModal(this.viewerPlayer);
+                }
+            }
+            if (!state.duel && this.duelModalOpen) {
+                const duelModal = document.getElementById('duel-choice-modal');
+                if (duelModal) duelModal.remove();
+                this.duelModalOpen = false;
+            }
+            if (state.duel && state.duel.choices && this.viewerPlayer && !state.duel.choices[this.viewerPlayer]) {
+                if (!this.duelModalOpen) {
+                    this.showDuelChoiceModal(state.duel);
+                }
+            }
+        }
+        this.render();
     }
 
     createSamurai(player, type, hidden = false) {
@@ -65,8 +116,10 @@ class Game {
     }
 
     showSetupModal(player) {
+        if (this.multiplayer && document.getElementById('setup-flag-modal')) return;
         const modal = document.createElement('div');
         modal.className = 'modal-overlay';
+        modal.id = 'setup-flag-modal';
         modal.innerHTML = `
             <div class="modal">
                 <h2>${player === 1 ? '⚔️ Blauer Clan' : '🛡️ Roter Clan'}</h2>
@@ -116,6 +169,11 @@ class Game {
 
         confirmBtn.addEventListener('click', () => {
             if (selectedCell) {
+                if (this.multiplayer) {
+                    this.sendCommand?.('placeFlag', selectedCell);
+                    modal.remove();
+                    return;
+                }
                 this.board[selectedCell.row][selectedCell.col] = { 
                     player, 
                     type: 'e' 
@@ -134,8 +192,10 @@ class Game {
     }
 
     showPieceAssignmentModal(player) {
+        if (this.multiplayer && document.getElementById('setup-assign-modal')) return;
         const modal = document.createElement('div');
         modal.className = 'modal-overlay';
+        modal.id = 'setup-assign-modal';
         modal.innerHTML = `
             <div class="modal">
                 <h2>${player === 1 ? '⚔️ Blauer Clan' : '🛡️ Roter Clan'}</h2>
@@ -298,6 +358,11 @@ class Game {
         });
 
         confirmBtn.addEventListener('click', () => {
+            if (this.multiplayer) {
+                this.sendCommand?.('assignSetup', { assignments });
+                modal.remove();
+                return;
+            }
             for (let [key, type] of Object.entries(assignments)) {
                 const [row, col] = key.split('-').map(Number);
                 const piece = { player, type };
@@ -321,6 +386,7 @@ class Game {
 
     handleCellClick(row, col) {
         if (this.gameOver || this.setupPhase) return;
+        if (this.multiplayer && this.viewerPlayer !== this.currentPlayer) return;
 
         const cell = this.board[row][col];
 
@@ -360,6 +426,12 @@ class Game {
     makeMove(fromRow, fromCol, toRow, toCol) {
         const movingPiece = this.board[fromRow][fromCol];
         const targetCell = this.board[toRow][toCol];
+        if (this.multiplayer) {
+            this.selectedCell = null;
+            this.sendCommand?.('move', { fromRow, fromCol, toRow, toCol });
+            this.render();
+            return;
+        }
 
         if (targetCell && targetCell.player === this.currentPlayer) {
             this.selectedCell = null;
@@ -543,6 +615,10 @@ class Game {
     }
 
     showDuelModal() {
+        if (this.multiplayer) {
+            this.showDuelChoiceModal();
+            return;
+        }
         const modal = document.createElement('div');
         modal.className = 'modal-overlay';
         modal.id = 'duel-modal';
@@ -609,6 +685,35 @@ class Game {
             duelPhase = 'revealing';
             
             this.resolveDuel(p1Choice, p2Choice, modal);
+        });
+    }
+
+    showDuelChoiceModal() {
+        if (document.getElementById('duel-choice-modal')) return;
+        const modal = document.createElement('div');
+        modal.className = 'modal-overlay';
+        modal.id = 'duel-choice-modal';
+        modal.innerHTML = `
+            <div class="modal">
+                <h2>⚔️ Samurai-Duell!</h2>
+                <p>Wähle deine Waffe</p>
+                <div class="duel-choices" id="duel-choices-single">
+                    <div class="duel-choice" data-choice="a"><span class="weapon-icon weapon-a"></span></div>
+                    <div class="duel-choice" data-choice="b"><span class="weapon-icon weapon-b"></span></div>
+                    <div class="duel-choice" data-choice="c"><span class="weapon-icon weapon-c"></span></div>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(modal);
+        this.duelModalOpen = true;
+
+        const choices = modal.querySelector('#duel-choices-single');
+        choices.addEventListener('click', (e) => {
+            const choice = e.target.closest('.duel-choice');
+            if (!choice) return;
+            this.sendCommand?.('duelChoice', { choice: choice.dataset.choice });
+            modal.remove();
+            this.duelModalOpen = false;
         });
     }
 
@@ -713,7 +818,8 @@ class Game {
                 
                 const piece = this.board[row][col];
                 if (piece) {
-                    const isHidden = !this.setupPhase && piece.player !== this.currentPlayer;
+                    const viewer = this.viewerPlayer ?? this.currentPlayer;
+                    const isHidden = !this.setupPhase && piece.player !== viewer;
                     const samurai = this.createSamurai(piece.player, piece.type, isHidden);
                     cell.appendChild(samurai);
                     cell.classList.add(piece.player === 1 ? 'team1' : 'team2');
@@ -751,12 +857,154 @@ class Game {
 const startButton = document.getElementById('start-game');
 const landing = document.getElementById('landing');
 const gameUi = document.getElementById('game-ui');
+const lobbyCodeInput = document.getElementById('lobby-code');
+const createLobbyButton = document.getElementById('create-lobby');
+const joinLobbyButton = document.getElementById('join-lobby');
+const lobbyStatus = document.getElementById('lobby-status');
+const lobbyInfo = document.getElementById('lobby-info');
+const turnTimer = document.getElementById('turn-timer');
+
+const host = location.hostname || 'localhost';
+const apiBase = `${location.protocol === 'https:' ? 'https' : 'http'}://${host}:3001`;
+const wsBase = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${host}:3002`;
+
 let game = null;
+let lobbyCode = null;
+let playerId = null;
+let playerIndex = null;
+let ws = null;
+let turnTimerInterval = null;
+
+function setLobbyStatus(text) {
+    lobbyStatus.textContent = text;
+}
+
+function updateLobbyInfo() {
+    lobbyInfo.textContent = lobbyCode ? `Lobby ${lobbyCode} • Spieler ${playerIndex}` : '';
+}
+
+function updateTurnTimer(state) {
+    if (turnTimerInterval) {
+        clearInterval(turnTimerInterval);
+        turnTimerInterval = null;
+    }
+    if (!state.turnStartedAt || state.setupPhase || state.gameOver) {
+        turnTimer.textContent = '';
+        return;
+    }
+    const update = () => {
+        const startedAt = new Date(state.turnStartedAt).getTime();
+        const remaining = Math.max(0, 120000 - (Date.now() - startedAt));
+        const minutes = Math.floor(remaining / 60000);
+        const seconds = Math.floor((remaining % 60000) / 1000);
+        turnTimer.textContent = `Zug-Timer: ${minutes}:${String(seconds).padStart(2, '0')}`;
+    };
+    update();
+    turnTimerInterval = setInterval(update, 1000);
+}
+
+function sendCommand(action, payload) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: 'command', lobbyCode, playerId, action, payload }));
+}
+
+function connectGateway() {
+    if (!lobbyCode || !playerId) return;
+    if (ws) {
+        ws.close();
+    }
+    ws = new WebSocket(wsBase);
+    ws.addEventListener('open', () => {
+        ws.send(JSON.stringify({ type: 'hello', lobbyCode, playerId }));
+        setLobbyStatus('Verbunden');
+    });
+    ws.addEventListener('message', (event) => {
+        const message = JSON.parse(event.data);
+        if (message.type === 'state') {
+            if (!game) {
+                game = new Game({ multiplayer: true, viewerPlayer: playerIndex, sendCommand });
+            }
+            game.viewerPlayer = playerIndex;
+            game.applyState(message.state);
+            updateTurnTimer(message.state);
+        } else if (message.type === 'error') {
+            setLobbyStatus(message.message || 'Fehler');
+        } else if (message.type === 'lobbyClosed') {
+            setLobbyStatus('Lobby beendet');
+        }
+    });
+    ws.addEventListener('close', () => {
+        if (lobbyCode) {
+            setLobbyStatus('Verbindung getrennt');
+            setTimeout(connectGateway, 2000);
+        }
+    });
+}
+
+async function createLobby() {
+    setLobbyStatus('Erstelle Lobby...');
+    const response = await fetch(`${apiBase}/lobbies`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({})
+    });
+    const data = await response.json();
+    if (!response.ok) {
+        setLobbyStatus(data.message || 'Lobby konnte nicht erstellt werden');
+        return;
+    }
+    lobbyCode = data.lobbyCode;
+    playerId = data.playerId;
+    playerIndex = data.playerIndex;
+    lobbyCodeInput.value = lobbyCode;
+    updateLobbyInfo();
+    connectGateway();
+    if (data.state && !game) {
+        game = new Game({ multiplayer: true, viewerPlayer: playerIndex, sendCommand });
+        game.applyState(data.state);
+        updateTurnTimer(data.state);
+    }
+}
+
+async function joinLobby() {
+    const code = lobbyCodeInput.value.trim().toUpperCase();
+    if (!code) {
+        setLobbyStatus('Lobby-Code fehlt');
+        return;
+    }
+    setLobbyStatus('Trete Lobby bei...');
+    const response = await fetch(`${apiBase}/lobbies/${code}/join`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({})
+    });
+    const data = await response.json();
+    if (!response.ok) {
+        setLobbyStatus(data.message || 'Lobby konnte nicht beigetreten werden');
+        return;
+    }
+    lobbyCode = data.lobbyCode;
+    playerId = data.playerId;
+    playerIndex = data.playerIndex;
+    updateLobbyInfo();
+    connectGateway();
+    if (data.state && !game) {
+        game = new Game({ multiplayer: true, viewerPlayer: playerIndex, sendCommand });
+        game.applyState(data.state);
+        updateTurnTimer(data.state);
+    }
+}
 
 startButton.addEventListener('click', () => {
     landing.style.display = 'none';
     gameUi.classList.add('active');
-    if (!game) {
-        game = new Game();
-    }
+    setLobbyStatus('Lobby erstellen oder beitreten');
+});
+
+createLobbyButton.addEventListener('click', () => {
+    createLobby().catch(() => setLobbyStatus('Lobby konnte nicht erstellt werden'));
+});
+
+joinLobbyButton.addEventListener('click', () => {
+    joinLobby().catch(() => setLobbyStatus('Lobby konnte nicht beigetreten werden'));
 });
