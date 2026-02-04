@@ -1045,7 +1045,7 @@ function sendCommand(action, payload) {
         })
         .then(({ error }) => {
             if (error) {
-                setLobbyStatus('Aktion abgelehnt');
+                setLobbyStatus(error.message || 'Aktion abgelehnt');
             }
         });
 }
@@ -1059,7 +1059,7 @@ async function createLobby() {
     }
     const { data, error } = await client.rpc('create_lobby');
     if (error) {
-        setLobbyStatus('Lobby konnte nicht erstellt werden');
+        setLobbyStatus(error.message || 'Lobby konnte nicht erstellt werden');
         return;
     }
     lobbyCode = data.lobby_code;
@@ -1090,7 +1090,7 @@ async function joinLobby() {
     }
     const { data, error } = await client.rpc('join_lobby', { lobby_code: code });
     if (error) {
-        setLobbyStatus('Lobby konnte nicht beigetreten werden');
+        setLobbyStatus(error.message || 'Lobby konnte nicht beigetreten werden');
         return;
     }
     lobbyCode = data.lobby_code;
