@@ -873,14 +873,11 @@ class Game {
 const startButton = document.getElementById('start-game');
 const landing = document.getElementById('landing');
 const gameUi = document.getElementById('game-ui');
-const apiUrlInput = document.getElementById('api-url');
-const wsUrlInput = document.getElementById('ws-url');
 const supabaseUrlInput = document.getElementById('supabase-url');
 const supabaseKeyInput = document.getElementById('supabase-key');
 const lobbyCodeInput = document.getElementById('lobby-code');
 const createLobbyButton = document.getElementById('create-lobby');
 const joinLobbyButton = document.getElementById('join-lobby');
-const saveServerButton = document.getElementById('save-server');
 const saveSupabaseButton = document.getElementById('save-supabase');
 const refreshLobbiesButton = document.getElementById('refresh-lobbies');
 const lobbyStatus = document.getElementById('lobby-status');
@@ -888,28 +885,18 @@ const lobbyInfo = document.getElementById('lobby-info');
 const turnTimer = document.getElementById('turn-timer');
 const lobbyList = document.getElementById('lobby-list');
 
-const host = location.hostname || 'localhost';
-const httpProtocol = location.protocol === 'https:' ? 'https' : 'http';
-const wsProtocol = location.protocol === 'https:' ? 'wss' : 'ws';
-const defaultApiBase = `${httpProtocol}://${host}:3001`;
-const defaultWsBase = `${wsProtocol}://${host}:3002`;
-const urlParams = new URLSearchParams(location.search);
-const initialApiBase = urlParams.get('api') || localStorage.getItem('samurai-api-base') || defaultApiBase;
-const initialWsBase = urlParams.get('ws') || localStorage.getItem('samurai-ws-base') || defaultWsBase;
 const initialSupabaseUrl = localStorage.getItem('samurai-supabase-url') || '';
 const initialSupabaseKey = localStorage.getItem('samurai-supabase-key') || '';
-let apiBase = initialApiBase;
-let wsBase = initialWsBase;
 
 let game = null;
 let lobbyCode = null;
 let playerId = null;
 let playerIndex = null;
-let ws = null;
 let turnTimerInterval = null;
 let lobbyListInterval = null;
 let supabaseClient = null;
-let supabaseChannel = null;
+let supabaseBroadcastChannel = null;
+let supabaseStateChannel = null;
 
 function setLobbyStatus(text) {
     lobbyStatus.textContent = text;
@@ -925,13 +912,6 @@ function normalizeBase(value, fallback) {
     return trimmed.replace(/\/+$/, '');
 }
 
-function applyServerInputs() {
-    apiBase = normalizeBase(apiUrlInput.value, defaultApiBase);
-    wsBase = normalizeBase(wsUrlInput.value, defaultWsBase);
-    localStorage.setItem('samurai-api-base', apiBase);
-    localStorage.setItem('samurai-ws-base', wsBase);
-}
-
 function applySupabaseInputs() {
     const url = normalizeBase(supabaseUrlInput.value, '');
     const key = supabaseKeyInput.value.trim();
@@ -945,30 +925,54 @@ function applySupabaseInputs() {
     return supabaseClient;
 }
 
-function subscribeSupabase(lobbyCodeValue) {
+function subscribeSupabaseBroadcast(lobbyCodeValue) {
     const client = supabaseClient || applySupabaseInputs();
     if (!client || !lobbyCodeValue) return;
-    if (supabaseChannel) {
-        supabaseChannel.unsubscribe();
+    if (supabaseBroadcastChannel) {
+        supabaseBroadcastChannel.unsubscribe();
     }
-    supabaseChannel = client.channel(`lobby:${lobbyCodeValue}:players`, { config: { private: true } });
-    supabaseChannel.on('broadcast', { event: 'INSERT' }, () => {
+    supabaseBroadcastChannel = client.channel(`lobby:${lobbyCodeValue}:players`, { config: { private: true } });
+    supabaseBroadcastChannel.on('broadcast', { event: 'INSERT' }, () => {
         setLobbyStatus('Neuer Spieler beigetreten');
     });
-    supabaseChannel.on('broadcast', { event: 'player_message' }, (payload) => {
+    supabaseBroadcastChannel.on('broadcast', { event: 'player_message' }, (payload) => {
         if (payload?.payload?.text) {
             setLobbyStatus(payload.payload.text);
         }
     });
-    supabaseChannel.subscribe((status) => {
+    supabaseBroadcastChannel.subscribe((status) => {
         if (status === 'SUBSCRIBED') {
-            supabaseChannel.send({
+            supabaseBroadcastChannel.send({
                 type: 'broadcast',
                 event: 'player_message',
                 payload: { text: 'Hi' }
             });
         }
     });
+}
+
+function subscribeLobbyState(lobbyCodeValue) {
+    const client = supabaseClient || applySupabaseInputs();
+    if (!client || !lobbyCodeValue) return;
+    if (supabaseStateChannel) {
+        supabaseStateChannel.unsubscribe();
+    }
+    supabaseStateChannel = client.channel(`lobby-state:${lobbyCodeValue}`);
+    supabaseStateChannel.on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'lobbies', filter: `code=eq.${lobbyCodeValue}` },
+        (payload) => {
+            const state = payload.new?.state;
+            if (!state) return;
+            if (!game) {
+                game = new Game({ multiplayer: true, viewerPlayer: playerIndex, sendCommand });
+            }
+            game.viewerPlayer = playerIndex;
+            game.applyState(state);
+            updateTurnTimer(state);
+        }
+    );
+    supabaseStateChannel.subscribe();
 }
 
 function renderLobbyList(lobbies) {
@@ -997,14 +1001,27 @@ function renderLobbyList(lobbies) {
 }
 
 async function fetchLobbies() {
-    applyServerInputs();
-    const response = await fetch(`${apiBase}/lobbies`);
-    const data = await response.json();
-    if (!response.ok) {
-        lobbyList.textContent = data.message || 'Lobbys konnten nicht geladen werden';
+    const client = supabaseClient || applySupabaseInputs();
+    if (!client) {
+        lobbyList.textContent = 'Supabase fehlt';
         return;
     }
-    renderLobbyList(data.lobbies || []);
+    const { data, error } = await client
+        .from('lobbies')
+        .select('code,status,updated_at,players(count)')
+        .in('status', ['waiting', 'active'])
+        .order('updated_at', { ascending: false })
+        .limit(50);
+    if (error) {
+        lobbyList.textContent = 'Lobbys konnten nicht geladen werden';
+        return;
+    }
+    const mapped = (data || []).map((lobby) => ({
+        code: lobby.code,
+        status: lobby.status,
+        players: lobby.players?.[0]?.count ?? 0
+    }));
+    renderLobbyList(mapped);
 }
 
 function updateTurnTimer(state) {
@@ -1028,64 +1045,42 @@ function updateTurnTimer(state) {
 }
 
 function sendCommand(action, payload) {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify({ type: 'command', lobbyCode, playerId, action, payload }));
-}
-
-function connectGateway() {
-    if (!lobbyCode || !playerId) return;
-    if (ws) {
-        ws.close();
-    }
-    ws = new WebSocket(wsBase);
-    ws.addEventListener('open', () => {
-        ws.send(JSON.stringify({ type: 'hello', lobbyCode, playerId }));
-        setLobbyStatus('Verbunden');
-    });
-    ws.addEventListener('message', (event) => {
-        const message = JSON.parse(event.data);
-        if (message.type === 'state') {
-            if (!game) {
-                game = new Game({ multiplayer: true, viewerPlayer: playerIndex, sendCommand });
+    const client = supabaseClient || applySupabaseInputs();
+    if (!client || !lobbyCode || !playerId) return;
+    client
+        .rpc('apply_command', {
+            lobby_code: lobbyCode,
+            player_id: playerId,
+            action,
+            payload
+        })
+        .then(({ error }) => {
+            if (error) {
+                setLobbyStatus('Aktion abgelehnt');
             }
-            game.viewerPlayer = playerIndex;
-            game.applyState(message.state);
-            updateTurnTimer(message.state);
-        } else if (message.type === 'error') {
-            setLobbyStatus(message.message || 'Fehler');
-        } else if (message.type === 'lobbyClosed') {
-            setLobbyStatus('Lobby beendet');
-        }
-    });
-    ws.addEventListener('close', () => {
-        if (lobbyCode) {
-            setLobbyStatus('Verbindung getrennt');
-            setTimeout(connectGateway, 2000);
-        }
-    });
+        });
 }
 
 async function createLobby() {
     setLobbyStatus('Erstelle Lobby...');
-    applyServerInputs();
-    const response = await fetch(`${apiBase}/lobbies`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({})
-    });
-    const data = await response.json();
-    if (!response.ok) {
-        setLobbyStatus(data.message || 'Lobby konnte nicht erstellt werden');
+    const client = supabaseClient || applySupabaseInputs();
+    if (!client) {
+        setLobbyStatus('Supabase fehlt');
         return;
     }
-    lobbyCode = data.lobbyCode;
-    playerId = data.playerId;
-    playerIndex = data.playerIndex;
+    const { data, error } = await client.rpc('create_lobby');
+    if (error) {
+        setLobbyStatus('Lobby konnte nicht erstellt werden');
+        return;
+    }
+    lobbyCode = data.lobby_code;
+    playerId = data.player_id;
+    playerIndex = data.player_index;
     lobbyCodeInput.value = lobbyCode;
     updateLobbyInfo();
-    subscribeSupabase(lobbyCode);
-    connectGateway();
-    if (data.state && !game) {
+    subscribeSupabaseBroadcast(lobbyCode);
+    subscribeLobbyState(lobbyCode);
+    if (data.state) {
         game = new Game({ multiplayer: true, viewerPlayer: playerIndex, sendCommand });
         game.applyState(data.state);
         updateTurnTimer(data.state);
@@ -1099,24 +1094,23 @@ async function joinLobby() {
         return;
     }
     setLobbyStatus('Trete Lobby bei...');
-    applyServerInputs();
-    const response = await fetch(`${apiBase}/lobbies/${code}/join`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({})
-    });
-    const data = await response.json();
-    if (!response.ok) {
-        setLobbyStatus(data.message || 'Lobby konnte nicht beigetreten werden');
+    const client = supabaseClient || applySupabaseInputs();
+    if (!client) {
+        setLobbyStatus('Supabase fehlt');
         return;
     }
-    lobbyCode = data.lobbyCode;
-    playerId = data.playerId;
-    playerIndex = data.playerIndex;
+    const { data, error } = await client.rpc('join_lobby', { lobby_code: code });
+    if (error) {
+        setLobbyStatus('Lobby konnte nicht beigetreten werden');
+        return;
+    }
+    lobbyCode = data.lobby_code;
+    playerId = data.player_id;
+    playerIndex = data.player_index;
     updateLobbyInfo();
-    subscribeSupabase(lobbyCode);
-    connectGateway();
-    if (data.state && !game) {
+    subscribeSupabaseBroadcast(lobbyCode);
+    subscribeLobbyState(lobbyCode);
+    if (data.state) {
         game = new Game({ multiplayer: true, viewerPlayer: playerIndex, sendCommand });
         game.applyState(data.state);
         updateTurnTimer(data.state);
@@ -1143,22 +1137,15 @@ joinLobbyButton.addEventListener('click', () => {
     joinLobby().catch(() => setLobbyStatus('Lobby konnte nicht beigetreten werden'));
 });
 
-saveServerButton.addEventListener('click', () => {
-    applyServerInputs();
-    setLobbyStatus('Server gespeichert');
-    fetchLobbies().catch(() => {});
-});
-
 saveSupabaseButton.addEventListener('click', () => {
     applySupabaseInputs();
     setLobbyStatus('Supabase gespeichert');
+    fetchLobbies().catch(() => {});
 });
 
 refreshLobbiesButton.addEventListener('click', () => {
     fetchLobbies().catch(() => {});
 });
 
-apiUrlInput.value = initialApiBase;
-wsUrlInput.value = initialWsBase;
 supabaseUrlInput.value = initialSupabaseUrl;
 supabaseKeyInput.value = initialSupabaseKey;
