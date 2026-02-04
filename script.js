@@ -19,6 +19,8 @@ class Game {
         this.setupStep = null;
         this.lastBattleSeq = null;
         this.duelModalOpen = false;
+        this.animationLock = false;
+        this.animationTimer = null;
         if (!this.multiplayer) {
             this.startSetupPhase();
         }
@@ -386,6 +388,7 @@ class Game {
 
     handleCellClick(row, col) {
         if (this.gameOver || this.setupPhase) return;
+        if (this.animationLock) return;
         if (this.multiplayer && this.viewerPlayer !== this.currentPlayer) return;
 
         const cell = this.board[row][col];
@@ -426,6 +429,7 @@ class Game {
     makeMove(fromRow, fromCol, toRow, toCol) {
         const movingPiece = this.board[fromRow][fromCol];
         const targetCell = this.board[toRow][toCol];
+        if (this.animationLock) return;
         if (this.multiplayer) {
             this.selectedCell = null;
             this.sendCommand?.('move', { fromRow, fromCol, toRow, toCol });
@@ -467,6 +471,7 @@ class Game {
     showBattleAnimation(attacker, defender, result, callback) {
         const overlay = document.createElement('div');
         overlay.className = 'battle-overlay';
+        this.setAnimationLock(6500);
         
         const arena = document.createElement('div');
         arena.className = 'battle-arena';
@@ -521,6 +526,17 @@ class Game {
             overlay.remove();
             callback();
         }, 6500);
+    }
+
+    setAnimationLock(duration) {
+        this.animationLock = true;
+        if (this.animationTimer) {
+            clearTimeout(this.animationTimer);
+        }
+        this.animationTimer = setTimeout(() => {
+            this.animationLock = false;
+            this.animationTimer = null;
+        }, duration);
     }
 
     createBattleVideo(type) {
@@ -857,16 +873,33 @@ class Game {
 const startButton = document.getElementById('start-game');
 const landing = document.getElementById('landing');
 const gameUi = document.getElementById('game-ui');
+const apiUrlInput = document.getElementById('api-url');
+const wsUrlInput = document.getElementById('ws-url');
+const supabaseUrlInput = document.getElementById('supabase-url');
+const supabaseKeyInput = document.getElementById('supabase-key');
 const lobbyCodeInput = document.getElementById('lobby-code');
 const createLobbyButton = document.getElementById('create-lobby');
 const joinLobbyButton = document.getElementById('join-lobby');
+const saveServerButton = document.getElementById('save-server');
+const saveSupabaseButton = document.getElementById('save-supabase');
+const refreshLobbiesButton = document.getElementById('refresh-lobbies');
 const lobbyStatus = document.getElementById('lobby-status');
 const lobbyInfo = document.getElementById('lobby-info');
 const turnTimer = document.getElementById('turn-timer');
+const lobbyList = document.getElementById('lobby-list');
 
 const host = location.hostname || 'localhost';
-const apiBase = `${location.protocol === 'https:' ? 'https' : 'http'}://${host}:3001`;
-const wsBase = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${host}:3002`;
+const httpProtocol = location.protocol === 'https:' ? 'https' : 'http';
+const wsProtocol = location.protocol === 'https:' ? 'wss' : 'ws';
+const defaultApiBase = `${httpProtocol}://${host}:3001`;
+const defaultWsBase = `${wsProtocol}://${host}:3002`;
+const urlParams = new URLSearchParams(location.search);
+const initialApiBase = urlParams.get('api') || localStorage.getItem('samurai-api-base') || defaultApiBase;
+const initialWsBase = urlParams.get('ws') || localStorage.getItem('samurai-ws-base') || defaultWsBase;
+const initialSupabaseUrl = localStorage.getItem('samurai-supabase-url') || '';
+const initialSupabaseKey = localStorage.getItem('samurai-supabase-key') || '';
+let apiBase = initialApiBase;
+let wsBase = initialWsBase;
 
 let game = null;
 let lobbyCode = null;
@@ -874,6 +907,9 @@ let playerId = null;
 let playerIndex = null;
 let ws = null;
 let turnTimerInterval = null;
+let lobbyListInterval = null;
+let supabaseClient = null;
+let supabaseChannel = null;
 
 function setLobbyStatus(text) {
     lobbyStatus.textContent = text;
@@ -881,6 +917,94 @@ function setLobbyStatus(text) {
 
 function updateLobbyInfo() {
     lobbyInfo.textContent = lobbyCode ? `Lobby ${lobbyCode} • Spieler ${playerIndex}` : '';
+}
+
+function normalizeBase(value, fallback) {
+    const trimmed = value.trim();
+    if (!trimmed) return fallback;
+    return trimmed.replace(/\/+$/, '');
+}
+
+function applyServerInputs() {
+    apiBase = normalizeBase(apiUrlInput.value, defaultApiBase);
+    wsBase = normalizeBase(wsUrlInput.value, defaultWsBase);
+    localStorage.setItem('samurai-api-base', apiBase);
+    localStorage.setItem('samurai-ws-base', wsBase);
+}
+
+function applySupabaseInputs() {
+    const url = normalizeBase(supabaseUrlInput.value, '');
+    const key = supabaseKeyInput.value.trim();
+    localStorage.setItem('samurai-supabase-url', url);
+    localStorage.setItem('samurai-supabase-key', key);
+    if (!url || !key || !window.supabase) {
+        supabaseClient = null;
+        return null;
+    }
+    supabaseClient = window.supabase.createClient(url, key);
+    return supabaseClient;
+}
+
+function subscribeSupabase(lobbyCodeValue) {
+    const client = supabaseClient || applySupabaseInputs();
+    if (!client || !lobbyCodeValue) return;
+    if (supabaseChannel) {
+        supabaseChannel.unsubscribe();
+    }
+    supabaseChannel = client.channel(`lobby:${lobbyCodeValue}:players`, { config: { private: true } });
+    supabaseChannel.on('broadcast', { event: 'INSERT' }, () => {
+        setLobbyStatus('Neuer Spieler beigetreten');
+    });
+    supabaseChannel.on('broadcast', { event: 'player_message' }, (payload) => {
+        if (payload?.payload?.text) {
+            setLobbyStatus(payload.payload.text);
+        }
+    });
+    supabaseChannel.subscribe((status) => {
+        if (status === 'SUBSCRIBED') {
+            supabaseChannel.send({
+                type: 'broadcast',
+                event: 'player_message',
+                payload: { text: 'Hi' }
+            });
+        }
+    });
+}
+
+function renderLobbyList(lobbies) {
+    lobbyList.innerHTML = '';
+    if (!lobbies.length) {
+        lobbyList.textContent = 'Keine offenen Lobbys';
+        return;
+    }
+    lobbies.forEach((lobby) => {
+        const item = document.createElement('div');
+        item.className = 'lobby-item';
+        const info = document.createElement('span');
+        const status = lobby.status === 'active' ? 'läuft' : 'wartet';
+        info.textContent = `Lobby ${lobby.code} • ${lobby.players}/2 • ${status}`;
+        const joinButton = document.createElement('button');
+        joinButton.type = 'button';
+        joinButton.textContent = 'Beitreten';
+        joinButton.addEventListener('click', () => {
+            lobbyCodeInput.value = lobby.code;
+            joinLobby().catch(() => setLobbyStatus('Lobby konnte nicht beigetreten werden'));
+        });
+        item.appendChild(info);
+        item.appendChild(joinButton);
+        lobbyList.appendChild(item);
+    });
+}
+
+async function fetchLobbies() {
+    applyServerInputs();
+    const response = await fetch(`${apiBase}/lobbies`);
+    const data = await response.json();
+    if (!response.ok) {
+        lobbyList.textContent = data.message || 'Lobbys konnten nicht geladen werden';
+        return;
+    }
+    renderLobbyList(data.lobbies || []);
 }
 
 function updateTurnTimer(state) {
@@ -943,6 +1067,7 @@ function connectGateway() {
 
 async function createLobby() {
     setLobbyStatus('Erstelle Lobby...');
+    applyServerInputs();
     const response = await fetch(`${apiBase}/lobbies`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -958,6 +1083,7 @@ async function createLobby() {
     playerIndex = data.playerIndex;
     lobbyCodeInput.value = lobbyCode;
     updateLobbyInfo();
+    subscribeSupabase(lobbyCode);
     connectGateway();
     if (data.state && !game) {
         game = new Game({ multiplayer: true, viewerPlayer: playerIndex, sendCommand });
@@ -973,6 +1099,7 @@ async function joinLobby() {
         return;
     }
     setLobbyStatus('Trete Lobby bei...');
+    applyServerInputs();
     const response = await fetch(`${apiBase}/lobbies/${code}/join`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -987,6 +1114,7 @@ async function joinLobby() {
     playerId = data.playerId;
     playerIndex = data.playerIndex;
     updateLobbyInfo();
+    subscribeSupabase(lobbyCode);
     connectGateway();
     if (data.state && !game) {
         game = new Game({ multiplayer: true, viewerPlayer: playerIndex, sendCommand });
@@ -999,6 +1127,12 @@ startButton.addEventListener('click', () => {
     landing.style.display = 'none';
     gameUi.classList.add('active');
     setLobbyStatus('Lobby erstellen oder beitreten');
+    if (!lobbyListInterval) {
+        fetchLobbies().catch(() => {});
+        lobbyListInterval = setInterval(() => {
+            fetchLobbies().catch(() => {});
+        }, 5000);
+    }
 });
 
 createLobbyButton.addEventListener('click', () => {
@@ -1008,3 +1142,23 @@ createLobbyButton.addEventListener('click', () => {
 joinLobbyButton.addEventListener('click', () => {
     joinLobby().catch(() => setLobbyStatus('Lobby konnte nicht beigetreten werden'));
 });
+
+saveServerButton.addEventListener('click', () => {
+    applyServerInputs();
+    setLobbyStatus('Server gespeichert');
+    fetchLobbies().catch(() => {});
+});
+
+saveSupabaseButton.addEventListener('click', () => {
+    applySupabaseInputs();
+    setLobbyStatus('Supabase gespeichert');
+});
+
+refreshLobbiesButton.addEventListener('click', () => {
+    fetchLobbies().catch(() => {});
+});
+
+apiUrlInput.value = initialApiBase;
+wsUrlInput.value = initialWsBase;
+supabaseUrlInput.value = initialSupabaseUrl;
+supabaseKeyInput.value = initialSupabaseKey;

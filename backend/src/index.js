@@ -12,6 +12,16 @@ const GATEWAY_PORT = Number(process.env.GATEWAY_PORT || 3002);
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
 const app = express();
+app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type');
+    if (req.method === 'OPTIONS') {
+        res.sendStatus(204);
+        return;
+    }
+    next();
+});
 app.use(express.json());
 
 const lobbyConnections = new Map();
@@ -203,6 +213,25 @@ app.post('/lobbies/:code/join', async (req, res) => {
         broadcast(lobby.code, { type: 'state', state });
     } catch (error) {
         res.status(500).json({ message: 'Lobby konnte nicht beigetreten werden' });
+    }
+});
+
+app.get('/lobbies', async (req, res) => {
+    try {
+        const { rows } = await pool.query(
+            `
+            SELECT l.code, l.status, l.updated_at, COUNT(p.id)::int AS players
+            FROM lobbies l
+            LEFT JOIN players p ON p.lobby_id = l.id
+            WHERE l.status IN ('waiting', 'active')
+            GROUP BY l.id
+            ORDER BY l.updated_at DESC
+            LIMIT 50
+            `
+        );
+        res.json({ lobbies: rows });
+    } catch (error) {
+        res.status(500).json({ message: 'Lobbys konnten nicht geladen werden' });
     }
 });
 
