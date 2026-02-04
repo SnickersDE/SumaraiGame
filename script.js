@@ -873,20 +873,17 @@ class Game {
 const startButton = document.getElementById('start-game');
 const landing = document.getElementById('landing');
 const gameUi = document.getElementById('game-ui');
-const supabaseUrlInput = document.getElementById('supabase-url');
-const supabaseKeyInput = document.getElementById('supabase-key');
 const lobbyCodeInput = document.getElementById('lobby-code');
 const createLobbyButton = document.getElementById('create-lobby');
 const joinLobbyButton = document.getElementById('join-lobby');
-const saveSupabaseButton = document.getElementById('save-supabase');
 const refreshLobbiesButton = document.getElementById('refresh-lobbies');
 const lobbyStatus = document.getElementById('lobby-status');
 const lobbyInfo = document.getElementById('lobby-info');
 const turnTimer = document.getElementById('turn-timer');
 const lobbyList = document.getElementById('lobby-list');
 
-const initialSupabaseUrl = localStorage.getItem('samurai-supabase-url') || '';
-const initialSupabaseKey = localStorage.getItem('samurai-supabase-key') || '';
+const SUPABASE_URL = 'https://gxcwaufhbmygixnssifv.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imd4Y3dhdWZoYm15Z2l4bnNzaWZ2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk3ODc0NjYsImV4cCI6MjA4NTM2MzQ2Nn0.gl2Q-PZ83shdlsTht6khPiy4p_2GVl_-shkCU_XzEIk';
 
 let game = null;
 let lobbyCode = null;
@@ -906,17 +903,9 @@ function updateLobbyInfo() {
     lobbyInfo.textContent = lobbyCode ? `Lobby ${lobbyCode} • Spieler ${playerIndex}` : '';
 }
 
-function normalizeBase(value, fallback) {
-    const trimmed = value.trim();
-    if (!trimmed) return fallback;
-    return trimmed.replace(/\/+$/, '');
-}
-
 function applySupabaseInputs() {
-    const url = normalizeBase(supabaseUrlInput.value, '');
-    const key = supabaseKeyInput.value.trim();
-    localStorage.setItem('samurai-supabase-url', url);
-    localStorage.setItem('samurai-supabase-key', key);
+    const url = SUPABASE_URL;
+    const key = SUPABASE_ANON_KEY;
     if (!url || !key || !window.supabase) {
         supabaseClient = null;
         return null;
@@ -1137,15 +1126,8 @@ joinLobbyButton.addEventListener('click', () => {
     joinLobby().catch(() => setLobbyStatus('Lobby konnte nicht beigetreten werden'));
 });
 
-saveSupabaseButton.addEventListener('click', () => {
-    applySupabaseInputs();
-    setLobbyStatus('Supabase gespeichert');
-    fetchLobbies().catch(() => {});
-});
-
 refreshLobbiesButton.addEventListener('click', () => {
     fetchLobbies().catch(() => {});
 });
 
-supabaseUrlInput.value = initialSupabaseUrl;
-supabaseKeyInput.value = initialSupabaseKey;
+applySupabaseInputs();
