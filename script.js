@@ -870,6 +870,8 @@ class Game {
     }
 }
 
+import { createClient } from '@supabase/supabase-js';
+
 const startButton = document.getElementById('start-game');
 const landing = document.getElementById('landing');
 const gameUi = document.getElementById('game-ui');
@@ -906,11 +908,11 @@ function updateLobbyInfo() {
 function applySupabaseInputs() {
     const url = SUPABASE_URL;
     const key = SUPABASE_ANON_KEY;
-    if (!url || !key || !window.supabase) {
+    if (!url || !key) {
         supabaseClient = null;
         return null;
     }
-    supabaseClient = window.supabase.createClient(url, key, {
+    supabaseClient = createClient(url, key, {
         auth: { persistSession: false, autoRefreshToken: false },
         global: { headers: { apikey: key } }
     });
