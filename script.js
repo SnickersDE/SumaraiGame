@@ -910,7 +910,10 @@ function applySupabaseInputs() {
         supabaseClient = null;
         return null;
     }
-    supabaseClient = window.supabase.createClient(url, key);
+    supabaseClient = window.supabase.createClient(url, key, {
+        auth: { persistSession: false, autoRefreshToken: false },
+        global: { headers: { apikey: key } }
+    });
     return supabaseClient;
 }
 
@@ -1002,7 +1005,7 @@ async function fetchLobbies() {
         .order('updated_at', { ascending: false })
         .limit(50);
     if (error) {
-        lobbyList.textContent = 'Lobbys konnten nicht geladen werden';
+        lobbyList.textContent = error.message || 'Lobbys konnten nicht geladen werden';
         return;
     }
     const mapped = (data || []).map((lobby) => ({
