@@ -960,6 +960,38 @@ let authSession = null;
 let readyPlayers = new Set();
 let localReady = false;
 let rpcHelper = null;
+const xn = (s) => {
+    const fetchFn = s || fetch;
+    return async (input, init = {}) => {
+        const headers = new Headers(init.headers || {});
+        if (init.body !== undefined && !headers.has('Content-Type')) {
+            headers.set('Content-Type', 'application/json');
+        }
+        const finalInit = {
+            ...init,
+            headers
+        };
+        if (finalInit.body && typeof finalInit.body === 'object' && !(finalInit.body instanceof FormData)) {
+            finalInit.body = JSON.stringify(finalInit.body);
+        }
+        const res = await fetchFn(input, finalInit);
+        const text = await res.text();
+        let json;
+        try {
+            json = text ? JSON.parse(text) : null;
+        } catch {
+            json = null;
+        }
+        return {
+            ok: res.ok,
+            status: res.status,
+            headers: res.headers,
+            data: json,
+            text,
+            raw: res
+        };
+    };
+};
 
 function setLobbyStatus(text) {
     lobbyStatus.textContent = text;
@@ -1359,6 +1391,31 @@ function sendCommand(action, payload) {
         .catch((error) => {
             const message = error?.details?.message || error.message || '';
             if (message.includes('apply_command_json') || message.includes('function') || error.status === 404) {
+                const accessToken = authSession?.access_token;
+                if (accessToken) {
+                    const fetchWithJson = xn();
+                    const url = `${SUPABASE_URL}/rest/v1/rpc/apply_command_json`;
+                    return fetchWithJson(url, {
+                        method: 'POST',
+                        headers: {
+                            apikey: SUPABASE_ANON_KEY,
+                            Authorization: `Bearer ${accessToken}`
+                        },
+                        body: {
+                            lobby_code: lobbyCode,
+                            player_id: playerId,
+                            action,
+                            payload: payload ?? {}
+                        }
+                    }).then((resp) => {
+                        if (resp.ok) return;
+                        return rpcHelper
+                            .rpcApplyCommand({ lobby_code: lobbyCode, player_id: playerId, action, payload })
+                            .catch((fallbackError) => {
+                                setLobbyStatus(fallbackError.message || 'Aktion abgelehnt');
+                            });
+                    });
+                }
                 return rpcHelper
                     .rpcApplyCommand({ lobby_code: lobbyCode, player_id: playerId, action, payload })
                     .catch((fallbackError) => {
