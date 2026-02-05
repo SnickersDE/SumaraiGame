@@ -959,6 +959,7 @@ let supabaseStateChannel = null;
 let authSession = null;
 let readyPlayers = new Set();
 let localReady = false;
+let broadcastReady = false;
 let rpcHelper = null;
 const xn = (s) => {
     const fetchFn = s || fetch;
@@ -1150,15 +1151,24 @@ function updateReadyStatus() {
 
 function handleReadyClick() {
     if (!lobbyCode || !supabaseBroadcastChannel) return;
+    if (!broadcastReady) {
+        setLobbyStatus('Verbindung wird aufgebaut...');
+        return;
+    }
     if (localReady) return;
     localReady = true;
     readyPlayers.add(playerId);
     updateReadyStatus();
-    supabaseBroadcastChannel.send({
+    const message = {
         type: 'broadcast',
         event: 'player_ready',
         payload: { playerId }
-    });
+    };
+    if (typeof supabaseBroadcastChannel.httpSend === 'function') {
+        supabaseBroadcastChannel.httpSend(message);
+    } else {
+        supabaseBroadcastChannel.send(message);
+    }
     if (readyPlayers.size >= 2 && game) {
         game.setLobbyReady(true);
     }
@@ -1252,6 +1262,7 @@ function subscribeSupabaseBroadcast(lobbyCodeValue) {
         supabaseBroadcastChannel.unsubscribe();
     }
     supabaseBroadcastChannel = client.channel(`lobby:${lobbyCodeValue}:players`, { config: { private: true } });
+    broadcastReady = false;
     supabaseBroadcastChannel.on('broadcast', { event: 'INSERT' }, () => {
         setLobbyStatus('Neuer Spieler beigetreten');
     });
@@ -1265,17 +1276,23 @@ function subscribeSupabaseBroadcast(lobbyCodeValue) {
         if (!readyId) return;
         readyPlayers.add(readyId);
         updateReadyStatus();
-        if (readyPlayers.size >= 2 && lobbyIsFull && game) {
+        if (readyPlayers.size >= 2 && game) {
             game.setLobbyReady(true);
         }
     });
     supabaseBroadcastChannel.subscribe((status) => {
         if (status === 'SUBSCRIBED') {
-            supabaseBroadcastChannel.send({
+            broadcastReady = true;
+            const message = {
                 type: 'broadcast',
                 event: 'player_message',
                 payload: { text: 'Hi' }
-            });
+            };
+            if (typeof supabaseBroadcastChannel.httpSend === 'function') {
+                supabaseBroadcastChannel.httpSend(message);
+            } else {
+                supabaseBroadcastChannel.send(message);
+            }
         }
     });
 }
