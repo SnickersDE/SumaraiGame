@@ -21,6 +21,9 @@ class Game {
         this.duelModalOpen = false;
         this.animationLock = false;
         this.animationTimer = null;
+        this.lobbyReady = false;
+        this.startAnimationShown = false;
+        this.onGameEnd = options.onGameEnd ?? null;
         if (!this.multiplayer) {
             this.startSetupPhase();
         }
@@ -46,7 +49,10 @@ class Game {
             this.endGame(state.winner);
         }
         if (this.multiplayer) {
-            if (!this.setupPhase || this.setupPlayer !== this.viewerPlayer) {
+            if (!this.lobbyReady) {
+                this.closeSetupModals();
+                this.setupStep = null;
+            } else if (!this.setupPhase || this.setupPlayer !== this.viewerPlayer) {
                 this.setupStep = null;
             } else {
                 const hasFlag = state.flags && state.flags[this.viewerPlayer];
@@ -69,6 +75,10 @@ class Game {
                     this.showDuelChoiceModal(state.duel);
                 }
             }
+        }
+        if (this.multiplayer && !this.setupPhase && !this.startAnimationShown) {
+            this.startAnimationShown = true;
+            this.showStartOverlay();
         }
         this.render();
     }
@@ -118,6 +128,7 @@ class Game {
     }
 
     showSetupModal(player) {
+        if (this.multiplayer && !this.lobbyReady) return;
         if (this.multiplayer && document.getElementById('setup-flag-modal')) return;
         const modal = document.createElement('div');
         modal.className = 'modal-overlay';
@@ -194,6 +205,7 @@ class Game {
     }
 
     showPieceAssignmentModal(player) {
+        if (this.multiplayer && !this.lobbyReady) return;
         if (this.multiplayer && document.getElementById('setup-assign-modal')) return;
         const modal = document.createElement('div');
         modal.className = 'modal-overlay';
@@ -733,6 +745,31 @@ class Game {
         });
     }
 
+    setLobbyReady(ready) {
+        this.lobbyReady = ready;
+        if (!ready) {
+            this.closeSetupModals();
+            this.startAnimationShown = false;
+        }
+    }
+
+    closeSetupModals() {
+        const flagModal = document.getElementById('setup-flag-modal');
+        const assignModal = document.getElementById('setup-assign-modal');
+        if (flagModal) flagModal.remove();
+        if (assignModal) assignModal.remove();
+    }
+
+    showStartOverlay() {
+        const overlay = document.createElement('div');
+        overlay.className = 'start-overlay';
+        overlay.innerHTML = '<div class="start-card">Die Schlacht beginnt</div>';
+        document.body.appendChild(overlay);
+        setTimeout(() => {
+            overlay.remove();
+        }, 2000);
+    }
+
     resolveDuel(p1Choice, p2Choice, modal) {
         const duelResult = modal.querySelector('#duel-result');
         const status = modal.querySelector('#duel-status');
@@ -775,11 +812,26 @@ class Game {
         setTimeout(() => {
             const modal = document.createElement('div');
             modal.className = 'modal-overlay';
+            if (this.multiplayer && this.viewerPlayer) {
+                const isWinner = winner === this.viewerPlayer;
+                modal.innerHTML = `
+                    <div class="modal">
+                        <h2>${isWinner ? '� DU HAST GEWONNEN!' : '💥 DU HAST VERLOREN!'}</h2>
+                        <p>Die feindliche Fahne wurde erobert!</p>
+                    </div>
+                `;
+                document.body.appendChild(modal);
+                setTimeout(() => {
+                    modal.remove();
+                    this.onGameEnd?.({ winner, isWinner });
+                }, 2500);
+                return;
+            }
             modal.innerHTML = `
                 <div class="modal">
-                    <h2>🏆 戦いの終わり</h2>
+                    <h2>� 戦いの終わり</h2>
                     <p style="font-size: 2rem; color: ${winner === 1 ? 'var(--player1)' : 'var(--player2)'};">
-                        ${winner === 1 ? '⚔️ Blauer Clan' : '🛡️ Roter Clan'} hat gewonnen!
+                        ${winner === 1 ? '⚔️ Roter Clan' : '🛡️ Blauer Clan'} hat gewonnen!
                     </p>
                     <p>Die feindliche Fahne wurde erobert!</p>
                     <button onclick="location.reload()">Neue Schlacht</button>
@@ -885,6 +937,8 @@ const lobbyCodeInput = document.getElementById('lobby-code');
 const createLobbyButton = document.getElementById('create-lobby');
 const joinLobbyButton = document.getElementById('join-lobby');
 const refreshLobbiesButton = document.getElementById('refresh-lobbies');
+const readyLobbyButton = document.getElementById('lobby-ready');
+const readyStatus = document.getElementById('ready-status');
 const lobbyStatus = document.getElementById('lobby-status');
 const lobbyInfo = document.getElementById('lobby-info');
 const turnTimer = document.getElementById('turn-timer');
@@ -903,6 +957,9 @@ let supabaseClient = null;
 let supabaseBroadcastChannel = null;
 let supabaseStateChannel = null;
 let authSession = null;
+let lobbyIsFull = false;
+let readyPlayers = new Set();
+let localReady = false;
 
 function setLobbyStatus(text) {
     lobbyStatus.textContent = text;
@@ -920,7 +977,7 @@ function applySupabaseInputs() {
         return null;
     }
     supabaseClient = createClient(url, key, {
-        auth: { persistSession: false, autoRefreshToken: false },
+        auth: { persistSession: true, autoRefreshToken: true, storage: window.sessionStorage },
         global: { headers: { apikey: key } }
     });
     return supabaseClient;
@@ -933,12 +990,96 @@ function updateAuthUi(session) {
         authLoginButton.disabled = true;
         authRegisterButton.disabled = true;
         authLogoutButton.disabled = false;
+        createLobbyButton.disabled = false;
+        joinLobbyButton.disabled = false;
+        refreshLobbiesButton.disabled = false;
+        readyLobbyButton.disabled = false;
     } else {
         authStatus.textContent = 'Nicht angemeldet';
         authLoginButton.disabled = false;
         authRegisterButton.disabled = false;
         authLogoutButton.disabled = true;
+        createLobbyButton.disabled = true;
+        joinLobbyButton.disabled = true;
+        refreshLobbiesButton.disabled = true;
+        readyLobbyButton.disabled = true;
     }
+}
+
+function resetReadyState() {
+    readyPlayers = new Set();
+    localReady = false;
+    updateReadyStatus();
+}
+
+function updateReadyStatus() {
+    if (!lobbyCode) {
+        readyStatus.textContent = '';
+        return;
+    }
+    if (!lobbyIsFull) {
+        readyStatus.textContent = 'Warte auf zweiten Spieler';
+        return;
+    }
+    if (readyPlayers.size >= 2) {
+        readyStatus.textContent = 'Beide bereit';
+        return;
+    }
+    readyStatus.textContent = localReady ? 'Du bist bereit' : 'Bereit?';
+}
+
+function handleReadyClick() {
+    if (!lobbyCode || !supabaseBroadcastChannel) return;
+    if (!lobbyIsFull) {
+        setLobbyStatus('Lobby ist noch nicht voll');
+        return;
+    }
+    if (localReady) return;
+    localReady = true;
+    readyPlayers.add(playerId);
+    updateReadyStatus();
+    supabaseBroadcastChannel.send({
+        type: 'broadcast',
+        event: 'player_ready',
+        payload: { playerId }
+    });
+    if (readyPlayers.size >= 2 && game) {
+        game.setLobbyReady(true);
+    }
+}
+
+async function deleteLobby() {
+    const client = supabaseClient || applySupabaseInputs();
+    if (!client || !lobbyCode) return;
+    await client.rpc('delete_lobby', { lobby_code: lobbyCode });
+}
+
+function returnToLanding() {
+    landing.style.display = 'flex';
+    gameUi.classList.remove('active');
+    lobbyCode = null;
+    playerId = null;
+    playerIndex = null;
+    lobbyIsFull = false;
+    resetReadyState();
+    setLobbyStatus('Nicht verbunden');
+    updateLobbyInfo();
+    if (supabaseBroadcastChannel) {
+        supabaseBroadcastChannel.unsubscribe();
+        supabaseBroadcastChannel = null;
+    }
+    if (supabaseStateChannel) {
+        supabaseStateChannel.unsubscribe();
+        supabaseStateChannel = null;
+    }
+    game = null;
+}
+
+function handleGameEnd({ isWinner }) {
+    if (isWinner) {
+        deleteLobby().catch(() => {});
+    }
+    returnToLanding();
 }
 
 async function handleLogin() {
@@ -1004,6 +1145,15 @@ function subscribeSupabaseBroadcast(lobbyCodeValue) {
             setLobbyStatus(payload.payload.text);
         }
     });
+    supabaseBroadcastChannel.on('broadcast', { event: 'player_ready' }, (payload) => {
+        const readyId = payload?.payload?.playerId;
+        if (!readyId) return;
+        readyPlayers.add(readyId);
+        updateReadyStatus();
+        if (readyPlayers.size >= 2 && lobbyIsFull && game) {
+            game.setLobbyReady(true);
+        }
+    });
     supabaseBroadcastChannel.subscribe((status) => {
         if (status === 'SUBSCRIBED') {
             supabaseBroadcastChannel.send({
@@ -1027,9 +1177,22 @@ function subscribeLobbyState(lobbyCodeValue) {
         { event: '*', schema: 'public', table: 'lobbies', filter: `code=eq.${lobbyCodeValue}` },
         (payload) => {
             const state = payload.new?.state;
+            const status = payload.new?.status;
+            const full = status === 'active' || status === 'playing';
+            if (full !== lobbyIsFull) {
+                lobbyIsFull = full;
+                updateReadyStatus();
+                if (!lobbyIsFull && game) {
+                    game.setLobbyReady(false);
+                    resetReadyState();
+                }
+            }
+            if (game && lobbyIsFull && readyPlayers.size >= 2) {
+                game.setLobbyReady(true);
+            }
             if (!state) return;
             if (!game) {
-                game = new Game({ multiplayer: true, viewerPlayer: playerIndex, sendCommand });
+                game = new Game({ multiplayer: true, viewerPlayer: playerIndex, sendCommand, onGameEnd: handleGameEnd });
             }
             game.viewerPlayer = playerIndex;
             game.applyState(state);
@@ -1142,10 +1305,12 @@ async function createLobby() {
     playerIndex = data.player_index;
     lobbyCodeInput.value = lobbyCode;
     updateLobbyInfo();
+    resetReadyState();
     subscribeSupabaseBroadcast(lobbyCode);
     subscribeLobbyState(lobbyCode);
     if (data.state) {
-        game = new Game({ multiplayer: true, viewerPlayer: playerIndex, sendCommand });
+        game = new Game({ multiplayer: true, viewerPlayer: playerIndex, sendCommand, onGameEnd: handleGameEnd });
+        game.setLobbyReady(false);
         game.applyState(data.state);
         updateTurnTimer(data.state);
     }
@@ -1172,10 +1337,12 @@ async function joinLobby() {
     playerId = data.player_id;
     playerIndex = data.player_index;
     updateLobbyInfo();
+    resetReadyState();
     subscribeSupabaseBroadcast(lobbyCode);
     subscribeLobbyState(lobbyCode);
     if (data.state) {
-        game = new Game({ multiplayer: true, viewerPlayer: playerIndex, sendCommand });
+        game = new Game({ multiplayer: true, viewerPlayer: playerIndex, sendCommand, onGameEnd: handleGameEnd });
+        game.setLobbyReady(false);
         game.applyState(data.state);
         updateTurnTimer(data.state);
     }
@@ -1209,6 +1376,10 @@ authLogoutButton.addEventListener('click', () => {
     handleLogout().catch(() => {
         authStatus.textContent = 'Abmeldung fehlgeschlagen';
     });
+});
+
+readyLobbyButton.addEventListener('click', () => {
+    handleReadyClick();
 });
 
 createLobbyButton.addEventListener('click', () => {
