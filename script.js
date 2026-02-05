@@ -875,6 +875,12 @@ import { createClient } from '@supabase/supabase-js';
 const startButton = document.getElementById('start-game');
 const landing = document.getElementById('landing');
 const gameUi = document.getElementById('game-ui');
+const authEmailInput = document.getElementById('auth-email');
+const authPasswordInput = document.getElementById('auth-password');
+const authLoginButton = document.getElementById('auth-login');
+const authRegisterButton = document.getElementById('auth-register');
+const authLogoutButton = document.getElementById('auth-logout');
+const authStatus = document.getElementById('auth-status');
 const lobbyCodeInput = document.getElementById('lobby-code');
 const createLobbyButton = document.getElementById('create-lobby');
 const joinLobbyButton = document.getElementById('join-lobby');
@@ -896,6 +902,7 @@ let lobbyListInterval = null;
 let supabaseClient = null;
 let supabaseBroadcastChannel = null;
 let supabaseStateChannel = null;
+let authSession = null;
 
 function setLobbyStatus(text) {
     lobbyStatus.textContent = text;
@@ -917,6 +924,69 @@ function applySupabaseInputs() {
         global: { headers: { apikey: key } }
     });
     return supabaseClient;
+}
+
+function updateAuthUi(session) {
+    authSession = session;
+    if (session?.user?.email) {
+        authStatus.textContent = `Angemeldet: ${session.user.email}`;
+        authLoginButton.disabled = true;
+        authRegisterButton.disabled = true;
+        authLogoutButton.disabled = false;
+    } else {
+        authStatus.textContent = 'Nicht angemeldet';
+        authLoginButton.disabled = false;
+        authRegisterButton.disabled = false;
+        authLogoutButton.disabled = true;
+    }
+}
+
+async function handleLogin() {
+    const client = supabaseClient || applySupabaseInputs();
+    if (!client) return;
+    const email = authEmailInput.value.trim();
+    const password = authPasswordInput.value;
+    if (!email || !password) {
+        authStatus.textContent = 'E-Mail und Passwort nötig';
+        return;
+    }
+    const { data, error } = await client.auth.signInWithPassword({ email, password });
+    if (error) {
+        authStatus.textContent = error.message || 'Anmeldung fehlgeschlagen';
+        return;
+    }
+    updateAuthUi(data.session);
+}
+
+async function handleRegister() {
+    const client = supabaseClient || applySupabaseInputs();
+    if (!client) return;
+    const email = authEmailInput.value.trim();
+    const password = authPasswordInput.value;
+    if (!email || !password) {
+        authStatus.textContent = 'E-Mail und Passwort nötig';
+        return;
+    }
+    const { data, error } = await client.auth.signUp({ email, password });
+    if (error) {
+        authStatus.textContent = error.message || 'Registrierung fehlgeschlagen';
+        return;
+    }
+    updateAuthUi(data.session);
+    if (!data.session) {
+        authStatus.textContent = 'Bestätige die E-Mail zum Einloggen';
+    }
+}
+
+async function handleLogout() {
+    const client = supabaseClient || applySupabaseInputs();
+    if (!client) return;
+    const { error } = await client.auth.signOut();
+    if (error) {
+        authStatus.textContent = error.message || 'Abmeldung fehlgeschlagen';
+        return;
+    }
+    updateAuthUi(null);
 }
 
 function subscribeSupabaseBroadcast(lobbyCodeValue) {
@@ -1123,6 +1193,24 @@ startButton.addEventListener('click', () => {
     }
 });
 
+authLoginButton.addEventListener('click', () => {
+    handleLogin().catch(() => {
+        authStatus.textContent = 'Anmeldung fehlgeschlagen';
+    });
+});
+
+authRegisterButton.addEventListener('click', () => {
+    handleRegister().catch(() => {
+        authStatus.textContent = 'Registrierung fehlgeschlagen';
+    });
+});
+
+authLogoutButton.addEventListener('click', () => {
+    handleLogout().catch(() => {
+        authStatus.textContent = 'Abmeldung fehlgeschlagen';
+    });
+});
+
 createLobbyButton.addEventListener('click', () => {
     createLobby().catch(() => setLobbyStatus('Lobby konnte nicht erstellt werden'));
 });
@@ -1136,3 +1224,12 @@ refreshLobbiesButton.addEventListener('click', () => {
 });
 
 applySupabaseInputs();
+updateAuthUi(null);
+if (supabaseClient) {
+    supabaseClient.auth.getSession().then(({ data }) => {
+        updateAuthUi(data.session);
+    });
+    supabaseClient.auth.onAuthStateChange((_event, session) => {
+        updateAuthUi(session);
+    });
+}

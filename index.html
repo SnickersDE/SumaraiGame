@@ -20,6 +20,18 @@
         
         <div class="game-container">
             <div class="info-panel">
+                <div class="auth-panel" id="auth-panel">
+                    <div class="auth-row">
+                        <input id="auth-email" type="email" placeholder="E-Mail">
+                        <input id="auth-password" type="password" placeholder="Passwort">
+                        <button id="auth-login" type="button">Anmelden</button>
+                        <button id="auth-register" type="button">Registrieren</button>
+                        <button id="auth-logout" type="button">Abmelden</button>
+                    </div>
+                    <div class="auth-meta">
+                        <div id="auth-status">Nicht angemeldet</div>
+                    </div>
+                </div>
                 <div class="lobby-panel" id="lobby-panel">
                     <div class="lobby-row">
                         <input id="lobby-code" type="text" placeholder="Lobby-Code" maxlength="6">

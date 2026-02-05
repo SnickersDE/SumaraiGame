@@ -134,6 +134,55 @@ h1 {
                 inset 0 2px 10px rgba(212, 175, 55, 0.2);
 }
 
+.auth-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 16px;
+    border-radius: 10px;
+    background: rgba(0, 0, 0, 0.25);
+    border: 2px solid rgba(212, 175, 55, 0.5);
+    margin-bottom: 18px;
+}
+
+.auth-row {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    align-items: center;
+}
+
+.auth-row input {
+    flex: 1;
+    min-width: 200px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    border: 2px solid rgba(212, 175, 55, 0.6);
+    background: rgba(0, 0, 0, 0.35);
+    color: #f5e6d3;
+    font-family: inherit;
+    font-size: 1rem;
+}
+
+.auth-row input:focus {
+    outline: none;
+    border-color: var(--accent-gold);
+    box-shadow: 0 0 12px rgba(212, 175, 55, 0.6);
+}
+
+.auth-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    font-size: 0.95rem;
+    color: #f5e6d3;
+}
+
+#auth-status {
+    color: var(--accent-gold);
+    font-weight: 700;
+}
+
 .lobby-panel {
     display: flex;
     flex-direction: column;
