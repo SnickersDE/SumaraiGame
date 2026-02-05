@@ -957,7 +957,6 @@ let supabaseClient = null;
 let supabaseBroadcastChannel = null;
 let supabaseStateChannel = null;
 let authSession = null;
-let lobbyIsFull = false;
 let readyPlayers = new Set();
 let localReady = false;
 let rpcHelper = null;
@@ -1039,9 +1038,39 @@ function initRpcHelper(supabase) {
         });
     }
 
+    async function rpcApplyCommandJson({ lobby_code, player_id, action, payload } = {}) {
+        if (!lobby_code || typeof lobby_code !== 'string') {
+            throw new TypeError('lobby_code (string) is required');
+        }
+        if (!player_id || typeof player_id !== 'string') {
+            throw new TypeError('player_id (uuid string) is required');
+        }
+        if (!action || typeof action !== 'string') {
+            throw new TypeError('action (string) is required');
+        }
+        if (payload !== null && typeof payload !== 'object') {
+            throw new TypeError('payload must be an object or null');
+        }
+        let jsonPayload = payload ?? {};
+        try {
+            JSON.stringify(jsonPayload);
+        } catch {
+            throw new TypeError('payload must be JSON-serializable');
+        }
+        return callRpc('apply_command_json', {
+            payload: {
+                lobby_code,
+                player_id,
+                action,
+                payload: jsonPayload
+            }
+        });
+    }
+
     return {
         rpcJoinLobby,
         rpcApplyCommand,
+        rpcApplyCommandJson,
         callRpc
     };
 }
@@ -1080,23 +1109,15 @@ function updateReadyStatus() {
         readyStatus.textContent = '';
         return;
     }
-    if (!lobbyIsFull) {
-        readyStatus.textContent = 'Warte auf zweiten Spieler';
-        return;
-    }
     if (readyPlayers.size >= 2) {
         readyStatus.textContent = 'Beide bereit';
         return;
     }
-    readyStatus.textContent = localReady ? 'Du bist bereit' : 'Bereit?';
+    readyStatus.textContent = localReady ? 'Du bist bereit' : 'Warte auf zweiten Spieler';
 }
 
 function handleReadyClick() {
     if (!lobbyCode || !supabaseBroadcastChannel) return;
-    if (!lobbyIsFull) {
-        setLobbyStatus('Lobby ist noch nicht voll');
-        return;
-    }
     if (localReady) return;
     localReady = true;
     readyPlayers.add(playerId);
@@ -1123,7 +1144,6 @@ function returnToLanding() {
     lobbyCode = null;
     playerId = null;
     playerIndex = null;
-    lobbyIsFull = false;
     resetReadyState();
     setLobbyStatus('Nicht verbunden');
     updateLobbyInfo();
@@ -1241,16 +1261,13 @@ function subscribeLobbyState(lobbyCodeValue) {
         (payload) => {
             const state = payload.new?.state;
             const status = payload.new?.status;
-            const full = status === 'active' || status === 'playing';
-            if (full !== lobbyIsFull) {
-                lobbyIsFull = full;
-                updateReadyStatus();
-                if (!lobbyIsFull && game) {
+            if (status === 'waiting') {
+                resetReadyState();
+                if (game) {
                     game.setLobbyReady(false);
-                    resetReadyState();
                 }
             }
-            if (game && lobbyIsFull && readyPlayers.size >= 2) {
+            if (game && readyPlayers.size >= 2) {
                 game.setLobbyReady(true);
             }
             if (!state) return;
@@ -1338,8 +1355,16 @@ function sendCommand(action, payload) {
     const client = supabaseClient || applySupabaseInputs();
     if (!client || !lobbyCode || !playerId || !rpcHelper) return;
     rpcHelper
-        .rpcApplyCommand({ lobby_code: lobbyCode, player_id: playerId, action, payload })
+        .rpcApplyCommandJson({ lobby_code: lobbyCode, player_id: playerId, action, payload })
         .catch((error) => {
+            const message = error?.details?.message || error.message || '';
+            if (message.includes('apply_command_json') || message.includes('function') || error.status === 404) {
+                return rpcHelper
+                    .rpcApplyCommand({ lobby_code: lobbyCode, player_id: playerId, action, payload })
+                    .catch((fallbackError) => {
+                        setLobbyStatus(fallbackError.message || 'Aktion abgelehnt');
+                    });
+            }
             setLobbyStatus(error.message || 'Aktion abgelehnt');
         });
 }
