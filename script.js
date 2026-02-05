@@ -960,6 +960,7 @@ let authSession = null;
 let lobbyIsFull = false;
 let readyPlayers = new Set();
 let localReady = false;
+let rpcHelper = null;
 
 function setLobbyStatus(text) {
     lobbyStatus.textContent = text;
@@ -974,13 +975,75 @@ function applySupabaseInputs() {
     const key = SUPABASE_ANON_KEY;
     if (!url || !key) {
         supabaseClient = null;
+        rpcHelper = null;
         return null;
     }
     supabaseClient = createClient(url, key, {
         auth: { persistSession: true, autoRefreshToken: true, storage: window.sessionStorage },
         global: { headers: { apikey: key } }
     });
+    rpcHelper = initRpcHelper(supabaseClient);
     return supabaseClient;
+}
+
+function initRpcHelper(supabase) {
+    if (!supabase) {
+        throw new Error('supabase client required');
+    }
+
+    async function callRpc(name, params) {
+        if (params !== null && typeof params !== 'object') {
+            throw new TypeError('rpc params must be an object');
+        }
+        const { data, error, status } = await supabase.rpc(name, params);
+        if (error) {
+            const err = new Error(error.message || 'rpc error');
+            err.details = error;
+            err.status = status;
+            throw err;
+        }
+        return data;
+    }
+
+    async function rpcJoinLobby({ lobby_code } = {}) {
+        if (!lobby_code || typeof lobby_code !== 'string') {
+            throw new TypeError('lobby_code (string) is required');
+        }
+        return callRpc('join_lobby', { lobby_code });
+    }
+
+    async function rpcApplyCommand({ lobby_code, player_id, action, payload } = {}) {
+        if (!lobby_code || typeof lobby_code !== 'string') {
+            throw new TypeError('lobby_code (string) is required');
+        }
+        if (!player_id || typeof player_id !== 'string') {
+            throw new TypeError('player_id (uuid string) is required');
+        }
+        if (!action || typeof action !== 'string') {
+            throw new TypeError('action (string) is required');
+        }
+        if (payload !== null && typeof payload !== 'object') {
+            throw new TypeError('payload must be an object or null');
+        }
+        let jsonPayload = payload ?? {};
+        try {
+            JSON.stringify(jsonPayload);
+        } catch {
+            throw new TypeError('payload must be JSON-serializable');
+        }
+        return callRpc('apply_command', {
+            lobby_code,
+            player_id,
+            action,
+            payload: jsonPayload
+        });
+    }
+
+    return {
+        rpcJoinLobby,
+        rpcApplyCommand,
+        callRpc
+    };
 }
 
 function updateAuthUi(session) {
@@ -1050,8 +1113,8 @@ function handleReadyClick() {
 
 async function deleteLobby() {
     const client = supabaseClient || applySupabaseInputs();
-    if (!client || !lobbyCode) return;
-    await client.rpc('delete_lobby', { lobby_code: lobbyCode });
+    if (!client || !lobbyCode || !rpcHelper) return;
+    await rpcHelper.callRpc('delete_lobby', { lobby_code: lobbyCode });
 }
 
 function returnToLanding() {
@@ -1273,30 +1336,25 @@ function updateTurnTimer(state) {
 
 function sendCommand(action, payload) {
     const client = supabaseClient || applySupabaseInputs();
-    if (!client || !lobbyCode || !playerId) return;
-    client
-        .rpc('apply_command', {
-            lobby_code: lobbyCode,
-            player_id: playerId,
-            action,
-            payload
-        })
-        .then(({ error }) => {
-            if (error) {
-                setLobbyStatus(error.message || 'Aktion abgelehnt');
-            }
+    if (!client || !lobbyCode || !playerId || !rpcHelper) return;
+    rpcHelper
+        .rpcApplyCommand({ lobby_code: lobbyCode, player_id: playerId, action, payload })
+        .catch((error) => {
+            setLobbyStatus(error.message || 'Aktion abgelehnt');
         });
 }
 
 async function createLobby() {
     setLobbyStatus('Erstelle Lobby...');
     const client = supabaseClient || applySupabaseInputs();
-    if (!client) {
+    if (!client || !rpcHelper) {
         setLobbyStatus('Supabase fehlt');
         return;
     }
-    const { data, error } = await client.rpc('create_lobby');
-    if (error) {
+    let data;
+    try {
+        data = await rpcHelper.callRpc('create_lobby', {});
+    } catch (error) {
         setLobbyStatus(error.message || 'Lobby konnte nicht erstellt werden');
         return;
     }
@@ -1324,12 +1382,14 @@ async function joinLobby() {
     }
     setLobbyStatus('Trete Lobby bei...');
     const client = supabaseClient || applySupabaseInputs();
-    if (!client) {
+    if (!client || !rpcHelper) {
         setLobbyStatus('Supabase fehlt');
         return;
     }
-    const { data, error } = await client.rpc('join_lobby', { lobby_code: code });
-    if (error) {
+    let data;
+    try {
+        data = await rpcHelper.rpcJoinLobby({ lobby_code: code });
+    } catch (error) {
         setLobbyStatus(error.message || 'Lobby konnte nicht beigetreten werden');
         return;
     }
