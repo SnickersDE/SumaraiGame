@@ -2,85 +2,333 @@ const SYMBOLS = {
     e: ''
 };
 
+const STORAGE_KEY = 'samurai-state-v1';
+const USER_KEY = 'samurai-user-v1';
+const LOBBY_KEY = 'samurai-lobby-v1';
+const CHANNEL_NAME = 'samurai-realtime-v1';
+
+const channel = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel(CHANNEL_NAME) : null;
+const supabaseClient = window.supabase && window.SUPABASE_URL && window.SUPABASE_ANON_KEY
+    ? window.supabase.createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY)
+    : null;
+let lobbyMessagesChannel = null;
+let realtimeLobbyId = null;
+
+async function setRealtimeAuthFromSession(session) {
+    if (!supabaseClient || !session?.access_token) return;
+    supabaseClient.realtime.setAuth(session.access_token);
+}
+
+async function ensurePlayerAuthRow(lobbyId) {
+    if (!supabaseClient || !currentUser || !lobbyId) return;
+    const { data } = await supabaseClient.auth.getSession();
+    const session = data?.session;
+    if (!session?.user?.id) return;
+    await supabaseClient.from('players').upsert({
+        id: currentUser.id,
+        lobby_id: lobbyId,
+        auth_user_id: session.user.id
+    }, { onConflict: 'id' });
+}
+
+function subscribePrivateLobbyChannel(lobbyId) {
+    if (!supabaseClient || !lobbyId) return;
+    if (lobbyMessagesChannel) {
+        supabaseClient.removeChannel(lobbyMessagesChannel);
+    }
+    lobbyMessagesChannel = supabaseClient
+        .channel(`lobby:${lobbyId}:messages`, { config: { private: true } })
+        .on('broadcast', { event: 'message_created' }, payload => {
+            if (payload?.payload?.type === 'state_sync') {
+                syncStateFromStorage();
+            }
+        })
+        .subscribe();
+    realtimeLobbyId = lobbyId;
+}
+
+function clearLobbyChannel() {
+    if (!supabaseClient || !lobbyMessagesChannel) return;
+    supabaseClient.removeChannel(lobbyMessagesChannel);
+    lobbyMessagesChannel = null;
+    realtimeLobbyId = null;
+}
+
+function createId() {
+    return `${Math.random().toString(36).slice(2, 8)}${Date.now().toString(36).slice(-5)}`;
+}
+
+function loadState() {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) {
+        return { users: {}, lobbies: {}, updatedAt: Date.now() };
+    }
+    try {
+        return JSON.parse(raw);
+    } catch {
+        return { users: {}, lobbies: {}, updatedAt: Date.now() };
+    }
+}
+
+function saveState(state) {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    if (channel) {
+        channel.postMessage({ type: 'state', updatedAt: state.updatedAt });
+    }
+}
+
+function updateState(updater) {
+    const current = loadState();
+    const next = updater(current) || current;
+    next.updatedAt = Date.now();
+    saveState(next);
+    return next;
+}
+
+function emptyBoard() {
+    return Array(6).fill(null).map(() => Array(7).fill(null));
+}
+
+function createNewGameState() {
+    return {
+        board: emptyBoard(),
+        currentPlayer: 1,
+        selectedCell: null,
+        gameOver: false,
+        winner: null,
+        setupPhase: true,
+        setupPlayer: 1,
+        player1Setup: [],
+        player2Setup: [],
+        pendingDuel: null,
+        turnIndex: 1,
+        turnEndsAt: null,
+        lastPenaltyTurnIndex: 0,
+        p1Penalties: 0,
+        p2Penalties: 0
+    };
+}
+
+function formatTime(ms) {
+    if (ms <= 0) return '00:00';
+    const totalSeconds = Math.ceil(ms / 1000);
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
+function getPlayerNumber(lobby, userId) {
+    const index = lobby.players.indexOf(userId);
+    return index === -1 ? null : index + 1;
+}
+
+function generateRandomSetup(player) {
+    const rows = player === 1 ? [0, 1] : [4, 5];
+    const cells = [];
+    rows.forEach(row => {
+        for (let col = 0; col < 7; col++) {
+            cells.push({ row, col });
+        }
+    });
+    const flagIndex = Math.floor(Math.random() * cells.length);
+    const flagPos = cells.splice(flagIndex, 1)[0];
+    const pool = [
+        ...Array(4).fill('a'),
+        ...Array(4).fill('b'),
+        ...Array(4).fill('c'),
+        ...Array(1).fill('d')
+    ];
+    for (let i = pool.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [pool[i], pool[j]] = [pool[j], pool[i]];
+    }
+    const assignments = {};
+    cells.forEach((cell, idx) => {
+        assignments[`${cell.row}-${cell.col}`] = pool[idx];
+    });
+    return { flagPos, assignments };
+}
+
+function applySetupToState(gameState, player, setupData) {
+    const nextState = { ...gameState, board: gameState.board.map(row => row.map(cell => (cell ? { ...cell } : null))) };
+    nextState.board[setupData.flagPos.row][setupData.flagPos.col] = { player, type: 'e' };
+    if (player === 1) {
+        nextState.player1Setup = [setupData.flagPos];
+    } else {
+        nextState.player2Setup = [setupData.flagPos];
+    }
+    Object.entries(setupData.assignments).forEach(([key, type]) => {
+        const [row, col] = key.split('-').map(Number);
+        const piece = { player, type };
+        if (type === 'd') {
+            piece.swordLives = 3;
+        }
+        nextState.board[row][col] = piece;
+    });
+    return nextState;
+}
+
 class Game {
     constructor(options = {}) {
-        this.board = Array(6).fill(null).map(() => Array(7).fill(null));
+        this.multiplayer = options.multiplayer ?? false;
+        this.playerNumber = options.playerNumber ?? 1;
+        this.onStateChange = options.onStateChange ?? null;
+        this.onGameEnd = options.onGameEnd ?? null;
+        this.suppressSync = false;
+        this.setupInProgress = false;
+        this.endModalShown = false;
+        if (options.initialState) {
+            this.setState(options.initialState);
+        } else {
+            this.initializeNewGame();
+        }
+        if (!this.multiplayer) {
+            this.startSetupPhase();
+        } else {
+            this.render();
+        }
+    }
+
+    initializeNewGame() {
+        this.board = emptyBoard();
         this.currentPlayer = 1;
         this.selectedCell = null;
         this.gameOver = false;
+        this.winner = null;
         this.setupPhase = true;
         this.setupPlayer = 1;
         this.player1Setup = [];
         this.player2Setup = [];
         this.pendingDuel = null;
-        this.multiplayer = options.multiplayer ?? false;
-        this.viewerPlayer = options.viewerPlayer ?? null;
-        this.sendCommand = options.sendCommand ?? null;
-        this.setupStep = null;
-        this.lastBattleSeq = null;
-        this.duelModalOpen = false;
-        this.animationLock = false;
-        this.animationTimer = null;
-        this.lobbyReady = false;
-        this.startAnimationShown = false;
-        this.onGameEnd = options.onGameEnd ?? null;
-        if (!this.multiplayer) {
-            this.startSetupPhase();
+        this.turnIndex = 1;
+        this.turnEndsAt = null;
+        this.lastPenaltyTurnIndex = 0;
+        this.p1Penalties = 0;
+        this.p2Penalties = 0;
+        this.endModalShown = false;
+        this.render();
+    }
+
+    setState(state) {
+        this.board = state.board || emptyBoard();
+        this.currentPlayer = state.currentPlayer ?? 1;
+        this.selectedCell = state.selectedCell ?? null;
+        this.gameOver = state.gameOver ?? false;
+        this.winner = state.winner ?? null;
+        this.setupPhase = state.setupPhase ?? true;
+        this.setupPlayer = state.setupPlayer ?? 1;
+        this.player1Setup = state.player1Setup ?? [];
+        this.player2Setup = state.player2Setup ?? [];
+        this.pendingDuel = state.pendingDuel ?? null;
+        this.turnIndex = state.turnIndex ?? 1;
+        this.turnEndsAt = state.turnEndsAt ?? null;
+        this.lastPenaltyTurnIndex = state.lastPenaltyTurnIndex ?? 0;
+        this.p1Penalties = state.p1Penalties ?? 0;
+        this.p2Penalties = state.p2Penalties ?? 0;
+    }
+
+    exportState() {
+        return {
+            board: this.board,
+            currentPlayer: this.currentPlayer,
+            selectedCell: this.selectedCell,
+            gameOver: this.gameOver,
+            winner: this.winner,
+            setupPhase: this.setupPhase,
+            setupPlayer: this.setupPlayer,
+            player1Setup: this.player1Setup,
+            player2Setup: this.player2Setup,
+            pendingDuel: this.pendingDuel,
+            turnIndex: this.turnIndex,
+            turnEndsAt: this.turnEndsAt,
+            lastPenaltyTurnIndex: this.lastPenaltyTurnIndex,
+            p1Penalties: this.p1Penalties,
+            p2Penalties: this.p2Penalties
+        };
+    }
+
+    applyRemoteState(state) {
+        const wasGameOver = this.gameOver;
+        this.suppressSync = true;
+        this.setState(state);
+        this.suppressSync = false;
+        this.render();
+        if (!wasGameOver && this.gameOver && this.winner) {
+            if (this.onGameEnd) {
+                this.onGameEnd(this.winner);
+            }
+            this.showEndModal(this.winner);
+        }
+    }
+
+    syncState() {
+        if (this.suppressSync) return;
+        if (this.onStateChange) {
+            this.onStateChange(this.exportState());
         }
     }
 
     startSetupPhase() {
-        this.showSetupModal(1);
+        this.showSetupModal(1, flagPos => {
+            this.showPieceAssignmentModal(1, flagPos, assignments => {
+                this.applySetupToBoard(1, flagPos, assignments);
+                this.showSetupModal(2, flagPos2 => {
+                    this.showPieceAssignmentModal(2, flagPos2, assignments2 => {
+                        this.applySetupToBoard(2, flagPos2, assignments2);
+                        this.setupPhase = false;
+                        this.currentPlayer = 1;
+                        this.turnIndex = 1;
+                        this.turnEndsAt = Date.now() + 30000;
+                        this.p1Penalties = 0;
+                        this.p2Penalties = 0;
+                        this.lastPenaltyTurnIndex = 0;
+                        this.winner = null;
+                        this.endModalShown = false;
+                        this.render();
+                        this.syncState();
+                    });
+                });
+            });
+        });
     }
 
-    applyState(state) {
-        const wasGameOver = this.gameOver;
-        this.board = state.board;
-        this.currentPlayer = state.currentPlayer;
-        this.setupPhase = state.setupPhase;
-        this.setupPlayer = state.setupPlayer;
-        this.gameOver = state.gameOver;
-        this.pendingDuel = state.duel || null;
-        if (state.battleSeq !== undefined && state.battleSeq !== this.lastBattleSeq && state.lastBattle) {
-            this.lastBattleSeq = state.battleSeq;
-            this.showBattleAnimation(state.lastBattle.attacker, state.lastBattle.defender, state.lastBattle.winner, () => {});
-        }
-        if (!wasGameOver && this.gameOver && state.winner) {
-            this.endGame(state.winner);
-        }
-        if (this.multiplayer) {
-            if (!this.lobbyReady) {
-                this.closeSetupModals();
-                this.setupStep = null;
-            } else if (!this.setupPhase || this.setupPlayer !== this.viewerPlayer) {
-                this.setupStep = null;
-            } else {
-                const hasFlag = state.flags && state.flags[this.viewerPlayer];
-                if (!hasFlag && this.setupStep !== 'flag') {
-                    this.setupStep = 'flag';
-                    this.showSetupModal(this.viewerPlayer);
+    beginPlayerSetup(player, onConfirmed) {
+        if (this.setupInProgress) return;
+        this.setupInProgress = true;
+        this.showSetupModal(player, flagPos => {
+            this.showPieceAssignmentModal(player, flagPos, assignments => {
+                this.applySetupToBoard(player, flagPos, assignments);
+                this.setupInProgress = false;
+                if (onConfirmed) {
+                    onConfirmed({ flagPos, assignments });
                 }
-                if (hasFlag && this.setupStep !== 'assign') {
-                    this.setupStep = 'assign';
-                    this.showPieceAssignmentModal(this.viewerPlayer);
-                }
-            }
-            if (!state.duel && this.duelModalOpen) {
-                const duelModal = document.getElementById('duel-choice-modal');
-                if (duelModal) duelModal.remove();
-                this.duelModalOpen = false;
-            }
-            if (state.duel && state.duel.choices && this.viewerPlayer && !state.duel.choices[this.viewerPlayer]) {
-                if (!this.duelModalOpen) {
-                    this.showDuelChoiceModal(state.duel);
-                }
-            }
-        }
-        if (this.multiplayer && !this.setupPhase && !this.startAnimationShown) {
-            this.startAnimationShown = true;
-            this.showStartOverlay();
-        }
+                this.render();
+                this.syncState();
+            });
+        });
+    }
+
+    autoSetupPlayer(player, setup) {
+        this.applySetupToBoard(player, setup.flagPos, setup.assignments);
         this.render();
+        this.syncState();
+    }
+
+    applySetupToBoard(player, flagPos, assignments) {
+        this.board[flagPos.row][flagPos.col] = { player, type: 'e' };
+        if (player === 1) {
+            this.player1Setup = [flagPos];
+        } else {
+            this.player2Setup = [flagPos];
+        }
+        Object.entries(assignments).forEach(([key, type]) => {
+            const [row, col] = key.split('-').map(Number);
+            const piece = { player, type };
+            if (type === 'd') {
+                piece.swordLives = 3;
+            }
+            this.board[row][col] = piece;
+        });
     }
 
     createSamurai(player, type, hidden = false) {
@@ -127,12 +375,9 @@ class Game {
         return `<span class="weapon-icon weapon-${type}"></span>`;
     }
 
-    showSetupModal(player) {
-        if (this.multiplayer && !this.lobbyReady) return;
-        if (this.multiplayer && document.getElementById('setup-flag-modal')) return;
+    showSetupModal(player, onConfirmed) {
         const modal = document.createElement('div');
         modal.className = 'modal-overlay';
-        modal.id = 'setup-flag-modal';
         modal.innerHTML = `
             <div class="modal">
                 <h2>${player === 1 ? '⚔️ Blauer Clan' : '🛡️ Roter Clan'}</h2>
@@ -181,35 +426,17 @@ class Game {
         }
 
         confirmBtn.addEventListener('click', () => {
-            if (selectedCell) {
-                if (this.multiplayer) {
-                    this.sendCommand?.('placeFlag', selectedCell);
-                    modal.remove();
-                    return;
-                }
-                this.board[selectedCell.row][selectedCell.col] = { 
-                    player, 
-                    type: 'e' 
-                };
-                
-                if (player === 1) {
-                    this.player1Setup.push(selectedCell);
-                } else {
-                    this.player2Setup.push(selectedCell);
-                }
-                
-                modal.remove();
-                this.showPieceAssignmentModal(player);
+            if (!selectedCell) return;
+            modal.remove();
+            if (onConfirmed) {
+                onConfirmed(selectedCell);
             }
         });
     }
 
-    showPieceAssignmentModal(player) {
-        if (this.multiplayer && !this.lobbyReady) return;
-        if (this.multiplayer && document.getElementById('setup-assign-modal')) return;
+    showPieceAssignmentModal(player, flagPos, onConfirmed) {
         const modal = document.createElement('div');
         modal.className = 'modal-overlay';
-        modal.id = 'setup-assign-modal';
         modal.innerHTML = `
             <div class="modal">
                 <h2>${player === 1 ? '⚔️ Blauer Clan' : '🛡️ Roter Clan'}</h2>
@@ -256,7 +483,6 @@ class Game {
         const assignmentCells = [];
 
         const rows = player === 1 ? [0, 1] : [4, 5];
-        const flagPos = player === 1 ? this.player1Setup[0] : this.player2Setup[0];
         
         for (let row of rows) {
             for (let col = 0; col < 7; col++) {
@@ -305,7 +531,7 @@ class Game {
             }
         }
 
-        function updatePieceSelector() {
+        const updatePieceSelector = () => {
             pieceSelector.querySelectorAll('.piece-option').forEach(option => {
                 const type = option.dataset.type;
                 const count = pieceCounts[type];
@@ -321,7 +547,7 @@ class Game {
                     option.classList.remove('depleted');
                 }
             });
-        }
+        };
 
         pieceSelector.addEventListener('click', (e) => {
             const option = e.target.closest('.piece-option');
@@ -372,36 +598,16 @@ class Game {
         });
 
         confirmBtn.addEventListener('click', () => {
-            if (this.multiplayer) {
-                this.sendCommand?.('assignSetup', { assignments });
-                modal.remove();
-                return;
-            }
-            for (let [key, type] of Object.entries(assignments)) {
-                const [row, col] = key.split('-').map(Number);
-                const piece = { player, type };
-                if (type === 'd') {
-                    piece.swordLives = 3;
-                }
-                this.board[row][col] = piece;
-            }
-            
             modal.remove();
-            
-            if (player === 1) {
-                this.showSetupModal(2);
-            } else {
-                this.setupPhase = false;
-                this.currentPlayer = 1;
-                this.render();
+            if (onConfirmed) {
+                onConfirmed(assignments);
             }
         });
     }
 
     handleCellClick(row, col) {
         if (this.gameOver || this.setupPhase) return;
-        if (this.animationLock) return;
-        if (this.multiplayer && this.viewerPlayer !== this.currentPlayer) return;
+        if (this.multiplayer && this.currentPlayer !== this.playerNumber) return;
 
         const cell = this.board[row][col];
 
@@ -441,13 +647,6 @@ class Game {
     makeMove(fromRow, fromCol, toRow, toCol) {
         const movingPiece = this.board[fromRow][fromCol];
         const targetCell = this.board[toRow][toCol];
-        if (this.animationLock) return;
-        if (this.multiplayer) {
-            this.selectedCell = null;
-            this.sendCommand?.('move', { fromRow, fromCol, toRow, toCol });
-            this.render();
-            return;
-        }
 
         if (targetCell && targetCell.player === this.currentPlayer) {
             this.selectedCell = null;
@@ -459,6 +658,19 @@ class Game {
             const result = this.resolveBattle(movingPiece.type, targetCell.type, movingPiece, targetCell);
             
             if (result === 'duel') {
+                if (this.multiplayer) {
+                    const choices = ['a', 'b', 'c'];
+                    const attackerChoice = choices[Math.floor(Math.random() * choices.length)];
+                    let defenderChoice = choices[Math.floor(Math.random() * choices.length)];
+                    while (defenderChoice === attackerChoice) {
+                        defenderChoice = choices[Math.floor(Math.random() * choices.length)];
+                    }
+                    const duelWinner = this.resolveBattle(attackerChoice, defenderChoice);
+                    this.showBattleAnimation(movingPiece, targetCell, duelWinner, () => {
+                        this.completeBattle(fromRow, fromCol, toRow, toCol, duelWinner);
+                    });
+                    return;
+                }
                 this.pendingDuel = {
                     fromRow, fromCol, toRow, toCol,
                     attacker: movingPiece,
@@ -476,14 +688,16 @@ class Game {
             this.board[fromRow][fromCol] = null;
             this.selectedCell = null;
             this.currentPlayer = this.currentPlayer === 1 ? 2 : 1;
+            this.turnIndex = (this.turnIndex ?? 0) + 1;
+            this.turnEndsAt = Date.now() + 30000;
             this.render();
+            this.syncState();
         }
     }
 
     showBattleAnimation(attacker, defender, result, callback) {
         const overlay = document.createElement('div');
         overlay.className = 'battle-overlay';
-        this.setAnimationLock(6500);
         
         const arena = document.createElement('div');
         arena.className = 'battle-arena';
@@ -513,23 +727,33 @@ class Game {
             video.currentTime = 0;
             video.play().catch(() => {});
         });
-        
-        // Kampf-Effekt
+        const countdown = document.createElement('div');
+        countdown.className = 'battle-countdown';
+        countdown.textContent = '3';
+        arena.appendChild(countdown);
+
+        const crown = document.createElement('div');
+        const winnerPlayer = result === 'attacker' ? attacker.player : defender.player;
+        crown.className = `battle-crown player${winnerPlayer}`;
+        crown.textContent = '👑';
+        arena.appendChild(crown);
+
         setTimeout(() => {
-            const effect = document.createElement('div');
-            effect.className = 'battle-effect';
-            effect.textContent = this.getBattleEffect(attacker.type, defender.type, result);
-            arena.appendChild(effect);
-        }, 1200);
-        
+            countdown.textContent = '2';
+        }, 1000);
+
         setTimeout(() => {
+            countdown.textContent = '1';
+        }, 2000);
+
+        setTimeout(() => {
+            countdown.style.opacity = '0';
+            crown.classList.add('show');
             const resultText = document.createElement('div');
             resultText.className = 'battle-result-text';
-            resultText.textContent = result === 'attacker' ? 
-                `${attacker.player === 1 ? 'Blauer' : 'Roter'} Clan siegt!` : 
-                `${defender.player === 1 ? 'Blauer' : 'Roter'} Clan verteidigt!`;
+            resultText.textContent = winnerPlayer === 1 ? 'Blauer Clan siegt!' : 'Roter Clan siegt!';
             arena.appendChild(resultText);
-        }, 2400);
+        }, 3000);
         
         overlay.appendChild(arena);
         document.body.appendChild(overlay);
@@ -537,18 +761,7 @@ class Game {
         setTimeout(() => {
             overlay.remove();
             callback();
-        }, 6500);
-    }
-
-    setAnimationLock(duration) {
-        this.animationLock = true;
-        if (this.animationTimer) {
-            clearTimeout(this.animationTimer);
-        }
-        this.animationTimer = setTimeout(() => {
-            this.animationLock = false;
-            this.animationTimer = null;
-        }, duration);
+        }, 5000);
     }
 
     createBattleVideo(type) {
@@ -608,7 +821,10 @@ class Game {
 
         this.selectedCell = null;
         this.currentPlayer = this.currentPlayer === 1 ? 2 : 1;
+        this.turnIndex = (this.turnIndex ?? 0) + 1;
+        this.turnEndsAt = Date.now() + 30000;
         this.render();
+        this.syncState();
     }
 
     resolveBattle(attacker, defender, attackerPiece = null, defenderPiece = null) {
@@ -643,10 +859,6 @@ class Game {
     }
 
     showDuelModal() {
-        if (this.multiplayer) {
-            this.showDuelChoiceModal();
-            return;
-        }
         const modal = document.createElement('div');
         modal.className = 'modal-overlay';
         modal.id = 'duel-modal';
@@ -716,60 +928,6 @@ class Game {
         });
     }
 
-    showDuelChoiceModal() {
-        if (document.getElementById('duel-choice-modal')) return;
-        const modal = document.createElement('div');
-        modal.className = 'modal-overlay';
-        modal.id = 'duel-choice-modal';
-        modal.innerHTML = `
-            <div class="modal">
-                <h2>⚔️ Samurai-Duell!</h2>
-                <p>Wähle deine Waffe</p>
-                <div class="duel-choices" id="duel-choices-single">
-                    <div class="duel-choice" data-choice="a"><span class="weapon-icon weapon-a"></span></div>
-                    <div class="duel-choice" data-choice="b"><span class="weapon-icon weapon-b"></span></div>
-                    <div class="duel-choice" data-choice="c"><span class="weapon-icon weapon-c"></span></div>
-                </div>
-            </div>
-        `;
-        document.body.appendChild(modal);
-        this.duelModalOpen = true;
-
-        const choices = modal.querySelector('#duel-choices-single');
-        choices.addEventListener('click', (e) => {
-            const choice = e.target.closest('.duel-choice');
-            if (!choice) return;
-            this.sendCommand?.('duelChoice', { choice: choice.dataset.choice });
-            modal.remove();
-            this.duelModalOpen = false;
-        });
-    }
-
-    setLobbyReady(ready) {
-        this.lobbyReady = ready;
-        if (!ready) {
-            this.closeSetupModals();
-            this.startAnimationShown = false;
-        }
-    }
-
-    closeSetupModals() {
-        const flagModal = document.getElementById('setup-flag-modal');
-        const assignModal = document.getElementById('setup-assign-modal');
-        if (flagModal) flagModal.remove();
-        if (assignModal) assignModal.remove();
-    }
-
-    showStartOverlay() {
-        const overlay = document.createElement('div');
-        overlay.className = 'start-overlay';
-        overlay.innerHTML = '<div class="start-card">Die Schlacht beginnt</div>';
-        document.body.appendChild(overlay);
-        setTimeout(() => {
-            overlay.remove();
-        }, 2000);
-    }
-
     resolveDuel(p1Choice, p2Choice, modal) {
         const duelResult = modal.querySelector('#duel-result');
         const status = modal.querySelector('#duel-status');
@@ -809,29 +967,25 @@ class Game {
 
     endGame(winner) {
         this.gameOver = true;
+        this.winner = winner;
+        this.syncState();
+        if (this.onGameEnd) {
+            this.onGameEnd(winner);
+        }
+        this.showEndModal(winner);
+    }
+
+    showEndModal(winner) {
+        if (this.endModalShown) return;
+        this.endModalShown = true;
         setTimeout(() => {
             const modal = document.createElement('div');
             modal.className = 'modal-overlay';
-            if (this.multiplayer && this.viewerPlayer) {
-                const isWinner = winner === this.viewerPlayer;
-                modal.innerHTML = `
-                    <div class="modal">
-                        <h2>${isWinner ? '� DU HAST GEWONNEN!' : '💥 DU HAST VERLOREN!'}</h2>
-                        <p>Die feindliche Fahne wurde erobert!</p>
-                    </div>
-                `;
-                document.body.appendChild(modal);
-                setTimeout(() => {
-                    modal.remove();
-                    this.onGameEnd?.({ winner, isWinner });
-                }, 2500);
-                return;
-            }
             modal.innerHTML = `
                 <div class="modal">
-                    <h2>� 戦いの終わり</h2>
+                    <h2>🏆 戦いの終わり</h2>
                     <p style="font-size: 2rem; color: ${winner === 1 ? 'var(--player1)' : 'var(--player2)'};">
-                        ${winner === 1 ? '⚔️ Roter Clan' : '🛡️ Blauer Clan'} hat gewonnen!
+                        ${winner === 1 ? '⚔️ Blauer Clan' : '🛡️ Roter Clan'} hat gewonnen!
                     </p>
                     <p>Die feindliche Fahne wurde erobert!</p>
                     <button onclick="location.reload()">Neue Schlacht</button>
@@ -886,8 +1040,9 @@ class Game {
                 
                 const piece = this.board[row][col];
                 if (piece) {
-                    const viewer = this.viewerPlayer ?? this.currentPlayer;
-                    const isHidden = !this.setupPhase && piece.player !== viewer;
+                    const isHidden = this.multiplayer
+                        ? !this.setupPhase && piece.player !== this.playerNumber
+                        : !this.setupPhase && piece.player !== this.currentPlayer;
                     const samurai = this.createSamurai(piece.player, piece.type, isHidden);
                     cell.appendChild(samurai);
                     cell.classList.add(piece.player === 1 ? 'team1' : 'team2');
@@ -922,644 +1077,548 @@ class Game {
     }
 }
 
-import { createClient } from '@supabase/supabase-js';
-
-const startButton = document.getElementById('start-game');
 const landing = document.getElementById('landing');
 const gameUi = document.getElementById('game-ui');
-const authEmailInput = document.getElementById('auth-email');
-const authPasswordInput = document.getElementById('auth-password');
-const authLoginButton = document.getElementById('auth-login');
-const authRegisterButton = document.getElementById('auth-register');
-const authLogoutButton = document.getElementById('auth-logout');
-const authStatus = document.getElementById('auth-status');
-const lobbyCodeInput = document.getElementById('lobby-code');
-const createLobbyButton = document.getElementById('create-lobby');
-const joinLobbyButton = document.getElementById('join-lobby');
-const refreshLobbiesButton = document.getElementById('refresh-lobbies');
-const readyLobbyButton = document.getElementById('lobby-ready');
-const readyStatus = document.getElementById('ready-status');
-const lobbyStatus = document.getElementById('lobby-status');
-const lobbyInfo = document.getElementById('lobby-info');
-const turnTimer = document.getElementById('turn-timer');
+const authPanel = document.getElementById('auth-panel');
+const rulesPanel = document.getElementById('rules-panel');
+const boardContainer = document.getElementById('board-container');
+const loginBtn = document.getElementById('login-btn');
+const usernameInput = document.getElementById('username-input');
+const createLobbyBtn = document.getElementById('create-lobby');
+const lobbyNameInput = document.getElementById('lobby-name-input');
+const landingLobbyList = document.getElementById('landing-lobby-list');
 const lobbyList = document.getElementById('lobby-list');
+const leaderboard = document.getElementById('leaderboard');
+const currentLobbyEl = document.getElementById('current-lobby');
+const currentUserEl = document.getElementById('current-user');
+const currentTeamEl = document.getElementById('current-team');
+const setupStatusEl = document.getElementById('setup-status');
+const setupTimerEl = document.getElementById('setup-timer');
+const turnTimerEl = document.getElementById('turn-timer');
+const p1PenaltiesEl = document.getElementById('p1-penalties');
+const p2PenaltiesEl = document.getElementById('p2-penalties');
+const leaveLobbyBtn = document.getElementById('leave-lobby');
 
-const SUPABASE_URL = 'https://gxcwaufhbmygixnssifv.supabase.co';
-const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imd4Y3dhdWZoYm15Z2l4bnNzaWZ2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk3ODc0NjYsImV4cCI6MjA4NTM2MzQ2Nn0.gl2Q-PZ83shdlsTht6khPiy4p_2GVl_-shkCU_XzEIk';
-
+let state = loadState();
+let currentUser = null;
+let currentLobbyId = localStorage.getItem(LOBBY_KEY);
 let game = null;
-let lobbyCode = null;
-let playerId = null;
-let playerIndex = null;
-let turnTimerInterval = null;
-let lobbyListInterval = null;
-let supabaseClient = null;
-let supabaseBroadcastChannel = null;
-let supabaseStateChannel = null;
-let authSession = null;
-let readyPlayers = new Set();
-let localReady = false;
-let broadcastReady = false;
-let rpcHelper = null;
-const xn = (s) => {
-    const fetchFn = s || fetch;
-    return async (input, init = {}) => {
-        const headers = new Headers(init.headers || {});
-        if (init.body !== undefined && !headers.has('Content-Type')) {
-            headers.set('Content-Type', 'application/json');
-        }
-        const finalInit = {
-            ...init,
-            headers
-        };
-        if (finalInit.body && typeof finalInit.body === 'object' && !(finalInit.body instanceof FormData)) {
-            finalInit.body = JSON.stringify(finalInit.body);
-        }
-        const res = await fetchFn(input, finalInit);
-        const text = await res.text();
-        let json;
-        try {
-            json = text ? JSON.parse(text) : null;
-        } catch {
-            json = null;
-        }
-        return {
-            ok: res.ok,
-            status: res.status,
-            headers: res.headers,
-            data: json,
-            text,
-            raw: res
-        };
-    };
-};
+let timerHandle = null;
+let turnTimerHandle = null;
 
-function setLobbyStatus(text) {
-    lobbyStatus.textContent = text;
-}
-
-function updateLobbyInfo() {
-    lobbyInfo.textContent = lobbyCode ? `Lobby ${lobbyCode} • Spieler ${playerIndex}` : '';
-}
-
-function applySupabaseInputs() {
-    const url = SUPABASE_URL;
-    const key = SUPABASE_ANON_KEY;
-    if (!url || !key) {
-        supabaseClient = null;
-        rpcHelper = null;
+function loadUser() {
+    const raw = localStorage.getItem(USER_KEY);
+    if (!raw) return null;
+    try {
+        return JSON.parse(raw);
+    } catch {
         return null;
     }
-    supabaseClient = createClient(url, key, {
-        auth: { persistSession: true, autoRefreshToken: true, storage: window.sessionStorage },
-        global: { headers: { apikey: key } }
-    });
-    rpcHelper = initRpcHelper(supabaseClient);
-    return supabaseClient;
 }
 
-function initRpcHelper(supabase) {
-    if (!supabase) {
-        throw new Error('supabase client required');
-    }
+function saveUser(user) {
+    localStorage.setItem(USER_KEY, JSON.stringify(user));
+}
 
-    async function callRpc(name, params) {
-        if (params !== null && typeof params !== 'object') {
-            throw new TypeError('rpc params must be an object');
-        }
-        const { data, error, status } = await supabase.rpc(name, params);
-        if (error) {
-            const err = new Error(error.message || 'rpc error');
-            err.details = error;
-            err.status = status;
-            throw err;
-        }
-        return data;
-    }
+function syncStateFromStorage() {
+    state = loadState();
+    renderAll();
+}
 
-    async function rpcJoinLobby({ lobby_code } = {}) {
-        if (!lobby_code || typeof lobby_code !== 'string') {
-            throw new TypeError('lobby_code (string) is required');
-        }
-        return callRpc('join_lobby', { lobby_code });
-    }
-
-    async function rpcApplyCommand({ lobby_code, player_id, action, payload } = {}) {
-        if (!lobby_code || typeof lobby_code !== 'string') {
-            throw new TypeError('lobby_code (string) is required');
-        }
-        if (!player_id || typeof player_id !== 'string') {
-            throw new TypeError('player_id (uuid string) is required');
-        }
-        if (!action || typeof action !== 'string') {
-            throw new TypeError('action (string) is required');
-        }
-        if (payload !== null && typeof payload !== 'object') {
-            throw new TypeError('payload must be an object or null');
-        }
-        let jsonPayload = payload ?? {};
-        try {
-            JSON.stringify(jsonPayload);
-        } catch {
-            throw new TypeError('payload must be JSON-serializable');
-        }
-        return callRpc('apply_command', {
-            lobby_code,
-            player_id,
-            action,
-            payload: jsonPayload
-        });
-    }
-
-    async function rpcApplyCommandJson({ lobby_code, player_id, action, payload } = {}) {
-        if (!lobby_code || typeof lobby_code !== 'string') {
-            throw new TypeError('lobby_code (string) is required');
-        }
-        if (!player_id || typeof player_id !== 'string') {
-            throw new TypeError('player_id (uuid string) is required');
-        }
-        if (!action || typeof action !== 'string') {
-            throw new TypeError('action (string) is required');
-        }
-        if (payload !== null && typeof payload !== 'object') {
-            throw new TypeError('payload must be an object or null');
-        }
-        let jsonPayload = payload ?? {};
-        try {
-            JSON.stringify(jsonPayload);
-        } catch {
-            throw new TypeError('payload must be JSON-serializable');
-        }
-        return callRpc('apply_command_json', {
-            payload: {
-                lobby_code,
-                player_id,
-                action,
-                payload: jsonPayload
-            }
-        });
-    }
-
-    return {
-        rpcJoinLobby,
-        rpcApplyCommand,
-        rpcApplyCommandJson,
-        callRpc
+if (channel) {
+    channel.onmessage = () => {
+        syncStateFromStorage();
     };
 }
 
-function updateAuthUi(session) {
-    authSession = session;
-    if (session?.user?.email) {
-        authStatus.textContent = `Angemeldet: ${session.user.email}`;
-        authLoginButton.disabled = true;
-        authRegisterButton.disabled = true;
-        authLogoutButton.disabled = false;
-        createLobbyButton.disabled = false;
-        joinLobbyButton.disabled = false;
-        refreshLobbiesButton.disabled = false;
-        readyLobbyButton.disabled = false;
-    } else {
-        authStatus.textContent = 'Nicht angemeldet';
-        authLoginButton.disabled = false;
-        authRegisterButton.disabled = false;
-        authLogoutButton.disabled = true;
-        createLobbyButton.disabled = true;
-        joinLobbyButton.disabled = true;
-        refreshLobbiesButton.disabled = true;
-        readyLobbyButton.disabled = true;
+window.addEventListener('storage', event => {
+    if (event.key === STORAGE_KEY) {
+        syncStateFromStorage();
     }
-}
+});
 
-function resetReadyState() {
-    readyPlayers = new Set();
-    localReady = false;
-    updateReadyStatus();
-}
-
-function updateReadyStatus() {
-    if (!lobbyCode) {
-        readyStatus.textContent = '';
+function renderLobbyList(container, lobbies) {
+    container.innerHTML = '';
+    const items = Object.values(lobbies).sort((a, b) => b.createdAt - a.createdAt);
+    if (!items.length) {
+        container.innerHTML = '<div class="lobby-card">Keine Lobbys aktiv</div>';
         return;
     }
-    if (readyPlayers.size >= 2) {
-        readyStatus.textContent = 'Beide bereit';
-        return;
-    }
-    readyStatus.textContent = localReady ? 'Du bist bereit' : 'Warte auf zweiten Spieler';
-}
-
-function handleReadyClick() {
-    if (!lobbyCode || !supabaseBroadcastChannel) return;
-    if (!broadcastReady) {
-        setLobbyStatus('Verbindung wird aufgebaut...');
-        return;
-    }
-    if (localReady) return;
-    localReady = true;
-    readyPlayers.add(playerId);
-    updateReadyStatus();
-    const message = {
-        type: 'broadcast',
-        event: 'player_ready',
-        payload: { playerId }
-    };
-    if (typeof supabaseBroadcastChannel.httpSend === 'function') {
-        supabaseBroadcastChannel.httpSend(message);
-    } else {
-        supabaseBroadcastChannel.send(message);
-    }
-    if (readyPlayers.size >= 2 && game) {
-        game.setLobbyReady(true);
-    }
-}
-
-async function deleteLobby() {
-    const client = supabaseClient || applySupabaseInputs();
-    if (!client || !lobbyCode || !rpcHelper) return;
-    await rpcHelper.callRpc('delete_lobby', { lobby_code: lobbyCode });
-}
-
-function returnToLanding() {
-    landing.style.display = 'flex';
-    gameUi.classList.remove('active');
-    lobbyCode = null;
-    playerId = null;
-    playerIndex = null;
-    resetReadyState();
-    setLobbyStatus('Nicht verbunden');
-    updateLobbyInfo();
-    if (supabaseBroadcastChannel) {
-        supabaseBroadcastChannel.unsubscribe();
-        supabaseBroadcastChannel = null;
-    }
-    if (supabaseStateChannel) {
-        supabaseStateChannel.unsubscribe();
-        supabaseStateChannel = null;
-    }
-    game = null;
-}
-
-function handleGameEnd({ isWinner }) {
-    if (isWinner) {
-        deleteLobby().catch(() => {});
-    }
-    returnToLanding();
-}
-
-async function handleLogin() {
-    const client = supabaseClient || applySupabaseInputs();
-    if (!client) return;
-    const email = authEmailInput.value.trim();
-    const password = authPasswordInput.value;
-    if (!email || !password) {
-        authStatus.textContent = 'E-Mail und Passwort nötig';
-        return;
-    }
-    const { data, error } = await client.auth.signInWithPassword({ email, password });
-    if (error) {
-        authStatus.textContent = error.message || 'Anmeldung fehlgeschlagen';
-        return;
-    }
-    updateAuthUi(data.session);
-}
-
-async function handleRegister() {
-    const client = supabaseClient || applySupabaseInputs();
-    if (!client) return;
-    const email = authEmailInput.value.trim();
-    const password = authPasswordInput.value;
-    if (!email || !password) {
-        authStatus.textContent = 'E-Mail und Passwort nötig';
-        return;
-    }
-    const { data, error } = await client.auth.signUp({ email, password });
-    if (error) {
-        authStatus.textContent = error.message || 'Registrierung fehlgeschlagen';
-        return;
-    }
-    updateAuthUi(data.session);
-    if (!data.session) {
-        authStatus.textContent = 'Bestätige die E-Mail zum Einloggen';
-    }
-}
-
-async function handleLogout() {
-    const client = supabaseClient || applySupabaseInputs();
-    if (!client) return;
-    const { error } = await client.auth.signOut();
-    if (error) {
-        authStatus.textContent = error.message || 'Abmeldung fehlgeschlagen';
-        return;
-    }
-    updateAuthUi(null);
-}
-
-function subscribeSupabaseBroadcast(lobbyCodeValue) {
-    const client = supabaseClient || applySupabaseInputs();
-    if (!client || !lobbyCodeValue) return;
-    if (supabaseBroadcastChannel) {
-        supabaseBroadcastChannel.unsubscribe();
-    }
-    supabaseBroadcastChannel = client.channel(`lobby:${lobbyCodeValue}:players`, { config: { private: true } });
-    broadcastReady = false;
-    supabaseBroadcastChannel.on('broadcast', { event: 'INSERT' }, () => {
-        setLobbyStatus('Neuer Spieler beigetreten');
-    });
-    supabaseBroadcastChannel.on('broadcast', { event: 'player_message' }, (payload) => {
-        if (payload?.payload?.text) {
-            setLobbyStatus(payload.payload.text);
-        }
-    });
-    supabaseBroadcastChannel.on('broadcast', { event: 'player_ready' }, (payload) => {
-        const readyId = payload?.payload?.playerId;
-        if (!readyId) return;
-        readyPlayers.add(readyId);
-        updateReadyStatus();
-        if (readyPlayers.size >= 2 && game) {
-            game.setLobbyReady(true);
-        }
-    });
-    supabaseBroadcastChannel.subscribe((status) => {
-        if (status === 'SUBSCRIBED') {
-            broadcastReady = true;
-            const message = {
-                type: 'broadcast',
-                event: 'player_message',
-                payload: { text: 'Hi' }
-            };
-            if (typeof supabaseBroadcastChannel.httpSend === 'function') {
-                supabaseBroadcastChannel.httpSend(message);
+    items.forEach(lobby => {
+        const card = document.createElement('div');
+        card.className = 'lobby-card';
+        const meta = document.createElement('div');
+        meta.className = 'lobby-meta';
+        const title = document.createElement('strong');
+        title.textContent = lobby.name;
+        const status = document.createElement('div');
+        status.className = 'lobby-status';
+        status.textContent = `${lobby.players.length}/2 Spieler · ${getLobbyStatusLabel(lobby)}`;
+        meta.appendChild(title);
+        meta.appendChild(status);
+        const isMember = lobby.players.includes(currentUser?.id);
+        if (!isMember) {
+            if (lobby.players.length < 2 && currentUser) {
+                const action = document.createElement('button');
+                action.type = 'button';
+                action.textContent = 'Beitreten';
+                action.addEventListener('click', () => joinLobby(lobby.id));
+                card.appendChild(meta);
+                card.appendChild(action);
             } else {
-                supabaseBroadcastChannel.send(message);
+                const pill = document.createElement('span');
+                pill.className = 'lobby-pill';
+                pill.textContent = 'Voll';
+                card.appendChild(meta);
+                card.appendChild(pill);
             }
+        } else {
+            card.appendChild(meta);
         }
+        container.appendChild(card);
     });
 }
 
-function subscribeLobbyState(lobbyCodeValue) {
-    const client = supabaseClient || applySupabaseInputs();
-    if (!client || !lobbyCodeValue) return;
-    if (supabaseStateChannel) {
-        supabaseStateChannel.unsubscribe();
-    }
-    supabaseStateChannel = client.channel(`lobby-state:${lobbyCodeValue}`);
-    supabaseStateChannel.on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'lobbies', filter: `code=eq.${lobbyCodeValue}` },
-        (payload) => {
-            const state = payload.new?.state;
-            const status = payload.new?.status;
-            if (status === 'waiting') {
-                resetReadyState();
-                if (game) {
-                    game.setLobbyReady(false);
-                }
-            }
-            if (game && readyPlayers.size >= 2) {
-                game.setLobbyReady(true);
-            }
-            if (!state) return;
-            if (!game) {
-                game = new Game({ multiplayer: true, viewerPlayer: playerIndex, sendCommand, onGameEnd: handleGameEnd });
-            }
-            game.viewerPlayer = playerIndex;
-            game.applyState(state);
-            updateTurnTimer(state);
-        }
-    );
-    supabaseStateChannel.subscribe();
-}
-
-function renderLobbyList(lobbies) {
-    lobbyList.innerHTML = '';
-    if (!lobbies.length) {
-        lobbyList.textContent = 'Keine offenen Lobbys';
+function renderLeaderboard() {
+    leaderboard.innerHTML = '';
+    const players = Object.values(state.users).sort((a, b) => (b.wins || 0) - (a.wins || 0));
+    if (!players.length) {
+        leaderboard.innerHTML = '<div class="leaderboard-item">Noch keine Siege</div>';
         return;
     }
-    lobbies.forEach((lobby) => {
+    players.forEach(player => {
         const item = document.createElement('div');
-        item.className = 'lobby-item';
-        const info = document.createElement('span');
-        const status = lobby.status === 'active' ? 'läuft' : 'wartet';
-        info.textContent = `Lobby ${lobby.code} • ${lobby.players}/2 • ${status}`;
-        const joinButton = document.createElement('button');
-        joinButton.type = 'button';
-        joinButton.textContent = 'Beitreten';
-        joinButton.addEventListener('click', () => {
-            lobbyCodeInput.value = lobby.code;
-            joinLobby().catch(() => setLobbyStatus('Lobby konnte nicht beigetreten werden'));
-        });
-        item.appendChild(info);
-        item.appendChild(joinButton);
-        lobbyList.appendChild(item);
+        item.className = 'leaderboard-item';
+        item.innerHTML = `<span>${player.name}</span><span>🏆 ${player.wins || 0}</span>`;
+        leaderboard.appendChild(item);
     });
 }
 
-async function fetchLobbies() {
-    const client = supabaseClient || applySupabaseInputs();
-    if (!client) {
-        lobbyList.textContent = 'Supabase fehlt';
-        return;
-    }
-    const { data, error } = await client
-        .from('lobbies')
-        .select('code,status,updated_at,players(count)')
-        .in('status', ['waiting', 'active'])
-        .order('updated_at', { ascending: false })
-        .limit(50);
-    if (error) {
-        lobbyList.textContent = error.message || 'Lobbys konnten nicht geladen werden';
-        return;
-    }
-    const mapped = (data || []).map((lobby) => ({
-        code: lobby.code,
-        status: lobby.status,
-        players: lobby.players?.[0]?.count ?? 0
-    }));
-    renderLobbyList(mapped);
+function getLobbyStatusLabel(lobby) {
+    if (lobby.status === 'setup') return 'Aufstellung';
+    if (lobby.status === 'playing') return 'Im Spiel';
+    if (lobby.status === 'finished') return 'Beendet';
+    return 'Warten';
 }
 
-function updateTurnTimer(state) {
-    if (turnTimerInterval) {
-        clearInterval(turnTimerInterval);
-        turnTimerInterval = null;
-    }
-    if (!state.turnStartedAt || state.setupPhase || state.gameOver) {
-        turnTimer.textContent = '';
+function renderSessionInfo() {
+    if (!currentLobbyId || !state.lobbies[currentLobbyId]) {
+        currentLobbyEl.textContent = '—';
+        currentUserEl.textContent = currentUser ? currentUser.name : '—';
+        currentTeamEl.textContent = '—';
+        setupStatusEl.textContent = '—';
+        setupTimerEl.textContent = '02:00';
+        turnTimerEl.textContent = '00:30';
+        p1PenaltiesEl.textContent = '0';
+        p2PenaltiesEl.textContent = '0';
         return;
     }
-    const update = () => {
-        const startedAt = new Date(state.turnStartedAt).getTime();
-        const remaining = Math.max(0, 120000 - (Date.now() - startedAt));
-        const minutes = Math.floor(remaining / 60000);
-        const seconds = Math.floor((remaining % 60000) / 1000);
-        turnTimer.textContent = `Zug-Timer: ${minutes}:${String(seconds).padStart(2, '0')}`;
-    };
-    update();
-    turnTimerInterval = setInterval(update, 1000);
+    const lobby = state.lobbies[currentLobbyId];
+    const playerNumber = getPlayerNumber(lobby, currentUser?.id);
+    currentLobbyEl.textContent = lobby.name;
+    currentUserEl.textContent = currentUser ? currentUser.name : '—';
+    currentTeamEl.textContent = playerNumber === 1 ? 'Blau' : playerNumber === 2 ? 'Rot' : '—';
+    setupStatusEl.textContent = getLobbyStatusLabel(lobby);
+    if (lobby.setupEndsAt) {
+        setupTimerEl.textContent = formatTime(lobby.setupEndsAt - Date.now());
+    } else {
+        setupTimerEl.textContent = '00:00';
+    }
+    const gameState = lobby.gameState || createNewGameState();
+    turnTimerEl.textContent = gameState.turnEndsAt ? formatTime(gameState.turnEndsAt - Date.now()) : '00:30';
+    p1PenaltiesEl.textContent = String(gameState.p1Penalties ?? 0);
+    p2PenaltiesEl.textContent = String(gameState.p2Penalties ?? 0);
 }
 
-function sendCommand(action, payload) {
-    const client = supabaseClient || applySupabaseInputs();
-    if (!client || !lobbyCode || !playerId || !rpcHelper) return;
-    rpcHelper
-        .rpcApplyCommandJson({ lobby_code: lobbyCode, player_id: playerId, action, payload })
-        .catch((error) => {
-            const message = error?.details?.message || error.message || '';
-            if (message.includes('apply_command_json') || message.includes('function') || error.status === 404) {
-                const accessToken = authSession?.access_token;
-                if (accessToken) {
-                    const fetchWithJson = xn();
-                    const url = `${SUPABASE_URL}/rest/v1/rpc/apply_command_json`;
-                    return fetchWithJson(url, {
-                        method: 'POST',
-                        headers: {
-                            apikey: SUPABASE_ANON_KEY,
-                            Authorization: `Bearer ${accessToken}`
-                        },
-                        body: {
-                            lobby_code: lobbyCode,
-                            player_id: playerId,
-                            action,
-                            payload: payload ?? {}
-                        }
-                    }).then((resp) => {
-                        if (resp.ok) return;
-                        return rpcHelper
-                            .rpcApplyCommand({ lobby_code: lobbyCode, player_id: playerId, action, payload })
-                            .catch((fallbackError) => {
-                                setLobbyStatus(fallbackError.message || 'Aktion abgelehnt');
-                            });
-                    });
-                }
-                return rpcHelper
-                    .rpcApplyCommand({ lobby_code: lobbyCode, player_id: playerId, action, payload })
-                    .catch((fallbackError) => {
-                        setLobbyStatus(fallbackError.message || 'Aktion abgelehnt');
-                    });
+function renderAll() {
+    renderLobbyList(landingLobbyList, state.lobbies);
+    renderLobbyList(lobbyList, state.lobbies);
+    renderLeaderboard();
+    renderSessionInfo();
+    const inLobby = currentLobbyId && state.lobbies[currentLobbyId] && state.lobbies[currentLobbyId].players.includes(currentUser?.id);
+    landing.style.display = inLobby ? 'none' : 'flex';
+    if (rulesPanel) {
+        const lobbyStatus = inLobby ? state.lobbies[currentLobbyId]?.status : null;
+        rulesPanel.style.display = !inLobby || lobbyStatus !== 'playing' ? 'block' : 'none';
+    }
+    if (boardContainer) {
+        const lobbyStatus = inLobby ? state.lobbies[currentLobbyId]?.status : null;
+        boardContainer.style.display = inLobby && lobbyStatus === 'playing' ? 'block' : 'none';
+    }
+    const player1Info = document.getElementById('player1-info');
+    const player2Info = document.getElementById('player2-info');
+    if (player1Info && player2Info) {
+        const lobbyStatus = inLobby ? state.lobbies[currentLobbyId]?.status : null;
+        const showPlayers = inLobby && lobbyStatus === 'playing';
+        player1Info.style.display = showPlayers ? 'block' : 'none';
+        player2Info.style.display = showPlayers ? 'block' : 'none';
+    }
+    if (inLobby) {
+        gameUi.classList.add('active');
+        startLobbySession(state.lobbies[currentLobbyId]);
+    } else {
+        gameUi.classList.remove('active');
+        stopSetupTimer();
+        stopTurnTimer();
+    }
+}
+
+function startLobbySession(lobby) {
+    const playerNumber = getPlayerNumber(lobby, currentUser.id);
+    if (!playerNumber) return;
+    if (!game) {
+        game = new Game({
+            multiplayer: true,
+            playerNumber,
+            initialState: lobby.gameState || createNewGameState(),
+            onStateChange: nextState => {
+                updateLobbyGameState(lobby.id, nextState);
+            },
+            onGameEnd: winner => {
+                recordWin(lobby.id, winner);
             }
-            setLobbyStatus(error.message || 'Aktion abgelehnt');
         });
-}
-
-async function createLobby() {
-    setLobbyStatus('Erstelle Lobby...');
-    const client = supabaseClient || applySupabaseInputs();
-    if (!client || !rpcHelper) {
-        setLobbyStatus('Supabase fehlt');
-        return;
+    } else {
+        game.applyRemoteState(lobby.gameState || createNewGameState());
     }
-    let data;
-    try {
-        data = await rpcHelper.callRpc('create_lobby', {});
-    } catch (error) {
-        setLobbyStatus(error.message || 'Lobby konnte nicht erstellt werden');
-        return;
+    if (lobby.status === 'setup' && !lobby.setupConfirmed?.[currentUser.id]) {
+        game.beginPlayerSetup(playerNumber, setupData => {
+            confirmPlayerSetup(lobby.id, setupData);
+        });
     }
-    lobbyCode = data.lobby_code;
-    playerId = data.player_id;
-    playerIndex = data.player_index;
-    lobbyCodeInput.value = lobbyCode;
-    updateLobbyInfo();
-    resetReadyState();
-    subscribeSupabaseBroadcast(lobbyCode);
-    subscribeLobbyState(lobbyCode);
-    if (data.state) {
-        game = new Game({ multiplayer: true, viewerPlayer: playerIndex, sendCommand, onGameEnd: handleGameEnd });
-        game.setLobbyReady(false);
-        game.applyState(data.state);
-        updateTurnTimer(data.state);
+    if (lobby.status === 'setup') {
+        startSetupTimer(lobby);
+        stopTurnTimer();
+    } else {
+        stopSetupTimer();
+        startTurnTimer();
     }
 }
 
-async function joinLobby() {
-    const code = lobbyCodeInput.value.trim().toUpperCase();
-    if (!code) {
-        setLobbyStatus('Lobby-Code fehlt');
-        return;
-    }
-    setLobbyStatus('Trete Lobby bei...');
-    const client = supabaseClient || applySupabaseInputs();
-    if (!client || !rpcHelper) {
-        setLobbyStatus('Supabase fehlt');
-        return;
-    }
-    let data;
-    try {
-        data = await rpcHelper.rpcJoinLobby({ lobby_code: code });
-    } catch (error) {
-        setLobbyStatus(error.message || 'Lobby konnte nicht beigetreten werden');
-        return;
-    }
-    lobbyCode = data.lobby_code;
-    playerId = data.player_id;
-    playerIndex = data.player_index;
-    updateLobbyInfo();
-    resetReadyState();
-    subscribeSupabaseBroadcast(lobbyCode);
-    subscribeLobbyState(lobbyCode);
-    if (data.state) {
-        game = new Game({ multiplayer: true, viewerPlayer: playerIndex, sendCommand, onGameEnd: handleGameEnd });
-        game.setLobbyReady(false);
-        game.applyState(data.state);
-        updateTurnTimer(data.state);
+function updateLobbyGameState(lobbyId, nextState) {
+    state = updateState(current => {
+        const lobby = current.lobbies[lobbyId];
+        if (!lobby) return current;
+        lobby.gameState = nextState;
+        if (lobby.status === 'playing' && nextState.gameOver) {
+            lobby.status = 'finished';
+        }
+        return current;
+    });
+}
+
+function confirmPlayerSetup(lobbyId, setupData) {
+    state = updateState(current => {
+        const lobby = current.lobbies[lobbyId];
+        if (!lobby || !currentUser) return current;
+        lobby.setups = lobby.setups || {};
+        lobby.setupConfirmed = lobby.setupConfirmed || {};
+        lobby.setups[currentUser.id] = setupData;
+        lobby.setupConfirmed[currentUser.id] = true;
+        lobby.gameState = game ? game.exportState() : lobby.gameState;
+        const allReady = lobby.players.every(playerId => lobby.setupConfirmed?.[playerId]);
+        if (allReady) {
+            lobby.status = 'playing';
+            lobby.setupEndsAt = null;
+            lobby.gameState.setupPhase = false;
+            lobby.gameState.currentPlayer = 1;
+            lobby.gameState.turnIndex = 1;
+            lobby.gameState.turnEndsAt = Date.now() + 30000;
+            lobby.gameState.lastPenaltyTurnIndex = 0;
+            lobby.gameState.p1Penalties = 0;
+            lobby.gameState.p2Penalties = 0;
+            lobby.gameState.winner = null;
+            lobby.gameId = lobby.gameId || createId();
+        }
+        return current;
+    });
+}
+
+function autoCompleteSetup(lobby) {
+    const missingPlayers = lobby.players.filter(id => !lobby.setupConfirmed?.[id]);
+    if (!missingPlayers.length) return;
+    const updatedState = updateState(current => {
+        const currentLobby = current.lobbies[lobby.id];
+        if (!currentLobby) return current;
+        currentLobby.setups = currentLobby.setups || {};
+        currentLobby.setupConfirmed = currentLobby.setupConfirmed || {};
+        missingPlayers.forEach(playerId => {
+            const playerNumber = getPlayerNumber(currentLobby, playerId);
+            if (!playerNumber) return;
+            const setupData = generateRandomSetup(playerNumber);
+            currentLobby.setups[playerId] = setupData;
+            currentLobby.setupConfirmed[playerId] = true;
+            if (game && playerId === currentUser?.id) {
+                game.autoSetupPlayer(playerNumber, setupData);
+            }
+            if (!game && currentLobby.gameState) {
+                currentLobby.gameState = applySetupToState(currentLobby.gameState, playerNumber, setupData);
+            }
+        });
+        const allReady = currentLobby.players.every(playerId => currentLobby.setupConfirmed?.[playerId]);
+        if (allReady) {
+            currentLobby.status = 'playing';
+            currentLobby.setupEndsAt = null;
+            currentLobby.gameState.setupPhase = false;
+            currentLobby.gameState.currentPlayer = 1;
+            currentLobby.gameState.turnIndex = 1;
+            currentLobby.gameState.turnEndsAt = Date.now() + 30000;
+            currentLobby.gameState.lastPenaltyTurnIndex = 0;
+            currentLobby.gameState.p1Penalties = 0;
+            currentLobby.gameState.p2Penalties = 0;
+            currentLobby.gameState.winner = null;
+            currentLobby.gameId = currentLobby.gameId || createId();
+        }
+        return current;
+    });
+    state = updatedState;
+}
+
+function startSetupTimer(lobby) {
+    stopSetupTimer();
+    if (!lobby.setupEndsAt) return;
+    timerHandle = setInterval(() => {
+        const updatedLobby = state.lobbies[currentLobbyId];
+        if (!updatedLobby || updatedLobby.status !== 'setup') {
+            stopSetupTimer();
+            return;
+        }
+        const remaining = updatedLobby.setupEndsAt - Date.now();
+        setupTimerEl.textContent = formatTime(remaining);
+        if (remaining <= 0) {
+            stopSetupTimer();
+            autoCompleteSetup(updatedLobby);
+            renderAll();
+        }
+    }, 1000);
+}
+
+function stopSetupTimer() {
+    if (timerHandle) {
+        clearInterval(timerHandle);
+        timerHandle = null;
     }
 }
 
-startButton.addEventListener('click', () => {
-    landing.style.display = 'none';
-    gameUi.classList.add('active');
-    setLobbyStatus('Lobby erstellen oder beitreten');
-    if (!lobbyListInterval) {
-        fetchLobbies().catch(() => {});
-        lobbyListInterval = setInterval(() => {
-            fetchLobbies().catch(() => {});
-        }, 5000);
+function startTurnTimer() {
+    stopTurnTimer();
+    turnTimerHandle = setInterval(() => {
+        const lobby = state.lobbies[currentLobbyId];
+        if (!lobby || lobby.status !== 'playing') {
+            stopTurnTimer();
+            return;
+        }
+        const gameState = lobby.gameState;
+        if (!gameState) return;
+        if (!gameState.turnEndsAt) {
+            state = updateState(current => {
+                const currentLobby = current.lobbies[currentLobbyId];
+                if (!currentLobby || !currentLobby.gameState) return current;
+                currentLobby.gameState.turnIndex = currentLobby.gameState.turnIndex || 1;
+                currentLobby.gameState.turnEndsAt = Date.now() + 30000;
+                return current;
+            });
+            return;
+        }
+        turnTimerEl.textContent = formatTime(gameState.turnEndsAt - Date.now());
+        p1PenaltiesEl.textContent = String(gameState.p1Penalties ?? 0);
+        p2PenaltiesEl.textContent = String(gameState.p2Penalties ?? 0);
+        if (Date.now() <= gameState.turnEndsAt || gameState.gameOver) return;
+
+        const updated = updateState(current => {
+            const currentLobby = current.lobbies[currentLobbyId];
+            if (!currentLobby || !currentLobby.gameState) return current;
+            const gs = currentLobby.gameState;
+            if (gs.gameOver) return current;
+            const currentTurn = gs.turnIndex ?? 1;
+            if ((gs.lastPenaltyTurnIndex ?? 0) >= currentTurn) return current;
+            const currentPlayer = gs.currentPlayer ?? 1;
+            if (currentPlayer === 1) {
+                gs.p1Penalties = (gs.p1Penalties ?? 0) + 1;
+            } else {
+                gs.p2Penalties = (gs.p2Penalties ?? 0) + 1;
+            }
+            gs.lastPenaltyTurnIndex = currentTurn;
+            const penaltyCount = currentPlayer === 1 ? gs.p1Penalties : gs.p2Penalties;
+            if (penaltyCount >= 2) {
+                gs.gameOver = true;
+                gs.winner = currentPlayer === 1 ? 2 : 1;
+                currentLobby.status = 'finished';
+                return current;
+            }
+            gs.currentPlayer = currentPlayer === 1 ? 2 : 1;
+            gs.turnIndex = currentTurn + 1;
+            gs.turnEndsAt = Date.now() + 30000;
+            return current;
+        });
+        state = updated;
+        renderAll();
+    }, 500);
+}
+
+function stopTurnTimer() {
+    if (turnTimerHandle) {
+        clearInterval(turnTimerHandle);
+        turnTimerHandle = null;
     }
-});
+}
 
-authLoginButton.addEventListener('click', () => {
-    handleLogin().catch(() => {
-        authStatus.textContent = 'Anmeldung fehlgeschlagen';
+function recordWin(lobbyId, winner) {
+    const lobby = state.lobbies[lobbyId];
+    if (!lobby) return;
+    const winnerUserId = lobby.players[winner - 1];
+    if (!winnerUserId || winnerUserId !== currentUser?.id) return;
+    if (lobby.recordedGameId === lobby.gameId) return;
+    state = updateState(current => {
+        const currentLobby = current.lobbies[lobbyId];
+        if (!currentLobby) return current;
+        const winnerId = currentLobby.players[winner - 1];
+        if (!winnerId) return current;
+        current.users[winnerId] = current.users[winnerId] || { name: currentUser.name, wins: 0 };
+        current.users[winnerId].wins = (current.users[winnerId].wins || 0) + 1;
+        currentLobby.recordedGameId = currentLobby.gameId;
+        return current;
     });
-});
+}
 
-authRegisterButton.addEventListener('click', () => {
-    handleRegister().catch(() => {
-        authStatus.textContent = 'Registrierung fehlgeschlagen';
+function joinLobby(lobbyId) {
+    if (!currentUser) return;
+    const updated = updateState(current => {
+        const lobby = current.lobbies[lobbyId];
+        if (!lobby) return current;
+        if (!lobby.players.includes(currentUser.id) && lobby.players.length < 2) {
+            lobby.players.push(currentUser.id);
+        }
+        if (lobby.players.length === 2 && lobby.status === 'waiting') {
+            lobby.status = 'setup';
+            lobby.setupEndsAt = Date.now() + 120000;
+            lobby.gameState = createNewGameState();
+            lobby.gameId = createId();
+            lobby.setupConfirmed = {};
+            lobby.setups = {};
+        }
+        return current;
     });
-});
+    state = updated;
+    currentLobbyId = lobbyId;
+    localStorage.setItem(LOBBY_KEY, lobbyId);
+    subscribePrivateLobbyChannel(lobbyId);
+    ensurePlayerAuthRow(lobbyId);
+    renderAll();
+}
 
-authLogoutButton.addEventListener('click', () => {
-    handleLogout().catch(() => {
-        authStatus.textContent = 'Abmeldung fehlgeschlagen';
+function createLobby() {
+    if (!currentUser) return;
+    const lobbyName = lobbyNameInput.value.trim() || `Lobby ${Object.keys(state.lobbies).length + 1}`;
+    const lobbyId = createId();
+    const updated = updateState(current => {
+        current.lobbies[lobbyId] = {
+            id: lobbyId,
+            name: lobbyName,
+            status: 'waiting',
+            players: [currentUser.id],
+            createdAt: Date.now(),
+            setupConfirmed: {},
+            setups: {},
+            gameState: createNewGameState(),
+            gameId: null,
+            recordedGameId: null,
+            setupEndsAt: null
+        };
+        return current;
     });
+    state = updated;
+    currentLobbyId = lobbyId;
+    localStorage.setItem(LOBBY_KEY, lobbyId);
+    lobbyNameInput.value = '';
+    renderAll();
+}
+
+function leaveLobby() {
+    if (!currentLobbyId || !currentUser) return;
+    const updated = updateState(current => {
+        const lobby = current.lobbies[currentLobbyId];
+        if (!lobby) return current;
+        lobby.players = lobby.players.filter(id => id !== currentUser.id);
+        if (lobby.players.length === 0) {
+            delete current.lobbies[currentLobbyId];
+            return current;
+        }
+        lobby.status = 'waiting';
+        lobby.setupEndsAt = null;
+        lobby.setupConfirmed = {};
+        lobby.setups = {};
+        lobby.gameState = createNewGameState();
+        lobby.gameId = null;
+        lobby.recordedGameId = null;
+        return current;
+    });
+    state = updated;
+    currentLobbyId = null;
+    localStorage.removeItem(LOBBY_KEY);
+    clearLobbyChannel();
+    game = null;
+    renderAll();
+}
+
+loginBtn.addEventListener('click', () => {
+    const name = usernameInput.value.trim();
+    if (!name) return;
+    const user = { id: currentUser?.id || createId(), name, wins: currentUser?.wins || 0 };
+    currentUser = user;
+    saveUser(user);
+    updateState(current => {
+        current.users[user.id] = current.users[user.id] || { name: user.name, wins: user.wins || 0 };
+        return current;
+    });
+    renderAll();
 });
 
-readyLobbyButton.addEventListener('click', () => {
-    handleReadyClick();
+createLobbyBtn.addEventListener('click', () => {
+    createLobby();
 });
 
-createLobbyButton.addEventListener('click', () => {
-    createLobby().catch(() => setLobbyStatus('Lobby konnte nicht erstellt werden'));
+leaveLobbyBtn.addEventListener('click', () => {
+    leaveLobby();
 });
 
-joinLobbyButton.addEventListener('click', () => {
-    joinLobby().catch(() => setLobbyStatus('Lobby konnte nicht beigetreten werden'));
-});
-
-refreshLobbiesButton.addEventListener('click', () => {
-    fetchLobbies().catch(() => {});
-});
-
-applySupabaseInputs();
-updateAuthUi(null);
+currentUser = loadUser();
+const externalUserName = window.SAMURAI_USER_NAME || window.AUTH_USER_NAME || window.SAMURAI_USER?.name;
+const externalUserId = window.SAMURAI_USER_ID || window.SAMURAI_USER?.id;
+if (externalUserName) {
+    currentUser = {
+        id: externalUserId || currentUser?.id || createId(),
+        name: externalUserName,
+        wins: currentUser?.wins || 0
+    };
+    saveUser(currentUser);
+    updateState(current => {
+        current.users[currentUser.id] = current.users[currentUser.id] || { name: currentUser.name, wins: currentUser.wins || 0 };
+        return current;
+    });
+    if (authPanel) {
+        authPanel.style.display = 'none';
+    }
+}
+if (currentUser) {
+    usernameInput.value = currentUser.name;
+}
 if (supabaseClient) {
     supabaseClient.auth.getSession().then(({ data }) => {
-        updateAuthUi(data.session);
+        setRealtimeAuthFromSession(data?.session);
+        if (currentLobbyId) {
+            subscribePrivateLobbyChannel(currentLobbyId);
+            ensurePlayerAuthRow(currentLobbyId);
+        }
     });
     supabaseClient.auth.onAuthStateChange((_event, session) => {
-        updateAuthUi(session);
+        setRealtimeAuthFromSession(session);
+        if (currentLobbyId) {
+            subscribePrivateLobbyChannel(currentLobbyId);
+            ensurePlayerAuthRow(currentLobbyId);
+        } else if (realtimeLobbyId) {
+            clearLobbyChannel();
+        }
     });
 }
+renderAll();
