@@ -979,6 +979,7 @@ const turnTimer = document.getElementById('turn-timer') as HTMLElement;
 const lobbyList = document.getElementById('lobby-list') as HTMLElement;
 
 const SUPABASE_URL = 'https://gxcwaufhbmygixnssifv.supabase.co';
+const SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_uts-r0z__XK9IVi6RAuPQQ_smiUmCA_';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imd4Y3dhdWZoYm15Z2l4bnNzaWZ2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk3ODc0NjYsImV4cCI6MjA4NTM2MzQ2Nn0.gl2Q-PZ83shdlsTht6khPiy4p_2GVl_-shkCU_XzEIk';
 const PLAYER_ID_KEY = 'myapp_player_id_v1';
 const PLAYER_SIDE_KEY = 'myapp_player_side_v1';
@@ -1092,7 +1093,7 @@ function updateLobbyInfo() {
 
 function applySupabaseInputs() {
     const url = SUPABASE_URL;
-    const key = SUPABASE_ANON_KEY;
+    const key = SUPABASE_PUBLISHABLE_KEY || SUPABASE_ANON_KEY;
     if (!url || !key) {
         supabaseClient = null;
         rpcHelper = null;
@@ -1515,7 +1516,7 @@ function sendCommand(action, payload) {
                     return fetchWithJson(url, {
                         method: 'POST',
                         headers: {
-                            apikey: SUPABASE_ANON_KEY,
+                            apikey: SUPABASE_PUBLISHABLE_KEY || SUPABASE_ANON_KEY,
                             Authorization: `Bearer ${accessToken}`
                         },
                         body: {
