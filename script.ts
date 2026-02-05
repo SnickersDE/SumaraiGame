@@ -946,6 +946,7 @@ const lobbyList = document.getElementById('lobby-list');
 const SUPABASE_URL = 'https://gxcwaufhbmygixnssifv.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imd4Y3dhdWZoYm15Z2l4bnNzaWZ2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk3ODc0NjYsImV4cCI6MjA4NTM2MzQ2Nn0.gl2Q-PZ83shdlsTht6khPiy4p_2GVl_-shkCU_XzEIk';
 const PLAYER_ID_KEY = 'myapp_player_id_v1';
+const PLAYER_SIDE_KEY = 'myapp_player_side_v1';
 
 let game = null;
 let lobbyCode = null;
@@ -998,6 +999,14 @@ function setLobbyStatus(text) {
     lobbyStatus.textContent = text;
 }
 
+function formatSupabaseError(error, fallback) {
+    const message = error?.details?.message || error?.message || fallback || 'Unbekannter Fehler';
+    if (message.includes('column "lobby_code" of relation "players" does not exist')) {
+        return 'Supabase-Schema passt nicht: players.lobby_code fehlt';
+    }
+    return message;
+}
+
 function getCachedPlayerId() {
     try {
         return localStorage.getItem(PLAYER_ID_KEY);
@@ -1014,6 +1023,32 @@ function persistPlayerId(id) {
             localStorage.removeItem(PLAYER_ID_KEY);
         }
     } catch {}
+}
+
+function getCachedPlayerSide() {
+    try {
+        return localStorage.getItem(PLAYER_SIDE_KEY);
+    } catch {
+        return null;
+    }
+}
+
+function persistPlayerSide(side) {
+    try {
+        if (side) {
+            localStorage.setItem(PLAYER_SIDE_KEY, side);
+        } else {
+            localStorage.removeItem(PLAYER_SIDE_KEY);
+        }
+    } catch {}
+}
+
+function getOrCreatePlayerSide() {
+    const cached = getCachedPlayerSide();
+    if (cached === 'red' || cached === 'blue') return cached;
+    const side = Math.random() < 0.5 ? 'red' : 'blue';
+    persistPlayerSide(side);
+    return side;
 }
 
 function updateLobbyInfo() {
@@ -1195,7 +1230,7 @@ function handleReadyClick() {
         payload: { playerId }
     };
     if (typeof supabaseBroadcastChannel.httpSend === 'function') {
-        supabaseBroadcastChannel.httpSend(message);
+        supabaseBroadcastChannel.httpSend(message.event, message.payload);
     } else {
         supabaseBroadcastChannel.send(message);
     }
@@ -1319,7 +1354,7 @@ function subscribeSupabaseBroadcast(lobbyCodeValue) {
                 payload: { text: 'Hi' }
             };
             if (typeof supabaseBroadcastChannel.httpSend === 'function') {
-                supabaseBroadcastChannel.httpSend(message);
+                supabaseBroadcastChannel.httpSend(message.event, message.payload);
             } else {
                 supabaseBroadcastChannel.send(message);
             }
@@ -1484,7 +1519,7 @@ async function createLobby() {
     try {
         data = await rpcHelper.callRpc('create_lobby', {});
     } catch (error) {
-        setLobbyStatus(error.message || 'Lobby konnte nicht erstellt werden');
+        setLobbyStatus(formatSupabaseError(error, 'Lobby konnte nicht erstellt werden'));
         return;
     }
     lobbyCode = data.lobby_code;
@@ -1519,17 +1554,18 @@ async function joinLobby() {
     let data;
     try {
         const cachedPlayerId = getCachedPlayerId();
+        const side = getOrCreatePlayerSide();
         if (cachedPlayerId) {
             try {
-                data = await rpcHelper.callRpc('join_lobby', { p_code: code, p_player_id: cachedPlayerId });
+                data = await rpcHelper.callRpc('join_lobby', { p_code: code, p_player_id: cachedPlayerId, p_side: side });
             } catch {
-                data = await rpcHelper.callRpc('join_lobby', { p_code: code });
+                data = await rpcHelper.callRpc('join_lobby', { p_code: code, p_side: side });
             }
         } else {
-            data = await rpcHelper.callRpc('join_lobby', { p_code: code });
+            data = await rpcHelper.callRpc('join_lobby', { p_code: code, p_side: side });
         }
     } catch (error) {
-        setLobbyStatus(error.message || 'Lobby konnte nicht beigetreten werden');
+        setLobbyStatus(formatSupabaseError(error, 'Lobby konnte nicht beigetreten werden'));
         return;
     }
     lobbyCode = data.lobby_code;
