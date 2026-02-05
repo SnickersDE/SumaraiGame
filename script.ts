@@ -5,7 +5,27 @@ const SYMBOLS = {
 };
 
 class Game {
-    constructor(options = {}) {
+    board;
+    currentPlayer;
+    selectedCell;
+    gameOver;
+    setupPhase;
+    setupPlayer;
+    player1Setup;
+    player2Setup;
+    pendingDuel;
+    multiplayer;
+    viewerPlayer;
+    sendCommand;
+    setupStep;
+    lastBattleSeq;
+    duelModalOpen;
+    animationLock;
+    animationTimer;
+    lobbyReady;
+    startAnimationShown;
+    onGameEnd;
+    constructor(options: any = {}) {
         this.board = Array(6).fill(null).map(() => Array(7).fill(null));
         this.currentPlayer = 1;
         this.selectedCell = null;
@@ -94,13 +114,14 @@ class Game {
             <div class="samurai-symbol"></div>
         `;
 
-        const symbol = samurai.querySelector('.samurai-symbol');
+        const symbol = samurai.querySelector('.samurai-symbol') as HTMLElement | null;
         this.setSymbol(symbol, type, hidden);
         
         return samurai;
     }
 
     setSymbol(symbol, type, hidden = false) {
+        if (!symbol) return;
         symbol.className = 'samurai-symbol';
         symbol.textContent = '';
         const samuraiElement = symbol.closest('.samurai');
@@ -145,10 +166,11 @@ class Game {
         `;
         document.body.appendChild(modal);
 
-        const grid = modal.querySelector('#setup-grid');
-        const confirmBtn = modal.querySelector('#confirm-flag');
+        const grid = modal.querySelector('#setup-grid') as HTMLElement | null;
+        const confirmBtn = modal.querySelector('#confirm-flag') as HTMLButtonElement | null;
         let selectedCell = null;
         let selectedElement = null;
+        if (!grid || !confirmBtn) return;
 
         const rows = player === 1 ? [0, 1] : [4, 5];
         
@@ -156,8 +178,8 @@ class Game {
             for (let col = 0; col < 7; col++) {
                 const cell = document.createElement('div');
                 cell.className = 'setup-cell';
-                cell.dataset.row = row;
-                cell.dataset.col = col;
+                cell.dataset.row = String(row);
+                cell.dataset.col = String(col);
                 const samurai = this.createSamurai(player, 'a', true);
                 cell.appendChild(samurai);
                 
@@ -165,14 +187,14 @@ class Game {
                     grid.querySelectorAll('.setup-cell').forEach(c => c.classList.remove('selected'));
                     if (selectedElement) {
                         const prevSamurai = selectedElement.querySelector('.samurai');
-                        const prevSymbol = selectedElement.querySelector('.samurai-symbol');
+                        const prevSymbol = selectedElement.querySelector('.samurai-symbol') as HTMLElement | null;
                         this.setSymbol(prevSymbol, 'a', true);
                         prevSamurai.classList.add('hidden');
                     }
                     cell.classList.add('selected');
                     selectedCell = { row, col };
                     selectedElement = cell;
-                    const symbol = cell.querySelector('.samurai-symbol');
+                    const symbol = cell.querySelector('.samurai-symbol') as HTMLElement | null;
                     this.setSymbol(symbol, 'e');
                     samurai.classList.remove('hidden');
                     confirmBtn.disabled = false;
@@ -247,10 +269,11 @@ class Game {
         `;
         document.body.appendChild(modal);
 
-        const pieceSelector = modal.querySelector('#piece-selector');
-        const grid = modal.querySelector('#setup-grid');
-        const confirmBtn = modal.querySelector('#confirm-setup');
-        const shuffleBtn = modal.querySelector('#shuffle-setup');
+        const pieceSelector = modal.querySelector('#piece-selector') as HTMLElement | null;
+        const grid = modal.querySelector('#setup-grid') as HTMLElement | null;
+        const confirmBtn = modal.querySelector('#confirm-setup') as HTMLButtonElement | null;
+        const shuffleBtn = modal.querySelector('#shuffle-setup') as HTMLButtonElement | null;
+        if (!pieceSelector || !grid || !confirmBtn || !shuffleBtn) return;
         
         let selectedPiece = null;
         const pieceCounts = { a: 4, b: 4, c: 4, d: 1 };
@@ -273,8 +296,8 @@ class Game {
                 
                 const cell = document.createElement('div');
                 cell.className = 'setup-cell';
-                cell.dataset.row = row;
-                cell.dataset.col = col;
+                cell.dataset.row = String(row);
+                cell.dataset.col = String(col);
                 const samurai = this.createSamurai(player, 'a', true);
                 cell.appendChild(samurai);
                 assignmentCells.push({ cell, samurai, row, col });
@@ -291,7 +314,7 @@ class Game {
                     
                     assignments[key] = selectedPiece;
                     pieceCounts[selectedPiece]--;
-                    const symbol = cell.querySelector('.samurai-symbol');
+                    const symbol = cell.querySelector('.samurai-symbol') as HTMLElement | null;
                     this.setSymbol(symbol, selectedPiece);
                     samurai.classList.remove('hidden');
                     cell.classList.add('selected');
@@ -309,24 +332,29 @@ class Game {
 
         function updatePieceSelector() {
             pieceSelector.querySelectorAll('.piece-option').forEach(option => {
-                const type = option.dataset.type;
+                const optionEl = option as HTMLElement;
+                const type = optionEl.dataset.type;
                 const count = pieceCounts[type];
-                option.querySelector('.piece-count').textContent = `${count} übrig`;
+                const countEl = optionEl.querySelector('.piece-count') as HTMLElement | null;
+                if (countEl) {
+                    countEl.textContent = `${count} übrig`;
+                }
                 
                 if (count === 0) {
-                    option.classList.add('depleted');
+                    optionEl.classList.add('depleted');
                     if (selectedPiece === type) {
                         selectedPiece = null;
-                        option.classList.remove('selected');
+                        optionEl.classList.remove('selected');
                     }
                 } else {
-                    option.classList.remove('depleted');
+                    optionEl.classList.remove('depleted');
                 }
             });
         }
 
         pieceSelector.addEventListener('click', (e) => {
-            const option = e.target.closest('.piece-option');
+            const target = e.target as HTMLElement | null;
+            const option = target ? (target.closest('.piece-option') as HTMLElement | null) : null;
             if (!option || option.classList.contains('depleted')) return;
             
             pieceSelector.querySelectorAll('.piece-option').forEach(o => o.classList.remove('selected'));
@@ -359,7 +387,7 @@ class Game {
                 const type = pool[index];
                 const key = `${item.row}-${item.col}`;
                 assignments[key] = type;
-                const symbol = item.cell.querySelector('.samurai-symbol');
+                const symbol = item.cell.querySelector('.samurai-symbol') as HTMLElement | null;
                 this.setSymbol(symbol, type);
                 item.samurai.classList.remove('hidden');
                 item.cell.classList.add('selected');
@@ -381,7 +409,7 @@ class Game {
             }
             for (let [key, type] of Object.entries(assignments)) {
                 const [row, col] = key.split('-').map(Number);
-                const piece = { player, type };
+                const piece: any = { player, type };
                 if (type === 'd') {
                     piece.swordLives = 3;
                 }
@@ -679,11 +707,12 @@ class Game {
         let p1Choice = null;
         let p2Choice = null;
 
-        const readyBtn = modal.querySelector('#ready-duel');
-        const duelResult = modal.querySelector('#duel-result');
-        const choicesP1 = modal.querySelector('#duel-choices-p1');
-        const choicesP2 = modal.querySelector('#duel-choices-p2');
-        const status = modal.querySelector('#duel-status');
+        const readyBtn = modal.querySelector('#ready-duel') as HTMLButtonElement | null;
+        const duelResult = modal.querySelector('#duel-result') as HTMLElement | null;
+        const choicesP1 = modal.querySelector('#duel-choices-p1') as HTMLElement | null;
+        const choicesP2 = modal.querySelector('#duel-choices-p2') as HTMLElement | null;
+        const status = modal.querySelector('#duel-status') as HTMLElement | null;
+        if (!readyBtn || !duelResult || !choicesP1 || !choicesP2 || !status) return;
 
         readyBtn.addEventListener('click', () => {
             if (duelPhase === 'waiting') {
@@ -695,7 +724,8 @@ class Game {
         });
 
         choicesP1.addEventListener('click', (e) => {
-            const choice = e.target.closest('.duel-choice');
+            const target = e.target as HTMLElement | null;
+            const choice = target ? (target.closest('.duel-choice') as HTMLElement | null) : null;
             if (!choice || duelPhase !== 'p1-choosing') return;
             
             p1Choice = choice.dataset.choice;
@@ -706,7 +736,8 @@ class Game {
         });
 
         choicesP2.addEventListener('click', (e) => {
-            const choice = e.target.closest('.duel-choice');
+            const target = e.target as HTMLElement | null;
+            const choice = target ? (target.closest('.duel-choice') as HTMLElement | null) : null;
             if (!choice || duelPhase !== 'p2-choosing') return;
             
             p2Choice = choice.dataset.choice;
@@ -717,7 +748,7 @@ class Game {
         });
     }
 
-    showDuelChoiceModal() {
+    showDuelChoiceModal(duel = null) {
         if (document.getElementById('duel-choice-modal')) return;
         const modal = document.createElement('div');
         modal.className = 'modal-overlay';
@@ -736,9 +767,11 @@ class Game {
         document.body.appendChild(modal);
         this.duelModalOpen = true;
 
-        const choices = modal.querySelector('#duel-choices-single');
+        const choices = modal.querySelector('#duel-choices-single') as HTMLElement | null;
+        if (!choices) return;
         choices.addEventListener('click', (e) => {
-            const choice = e.target.closest('.duel-choice');
+            const target = e.target as HTMLElement | null;
+            const choice = target ? (target.closest('.duel-choice') as HTMLElement | null) : null;
             if (!choice) return;
             this.sendCommand?.('duelChoice', { choice: choice.dataset.choice });
             modal.remove();
@@ -918,30 +951,32 @@ class Game {
         document.getElementById('player1-info').classList.toggle('active', this.currentPlayer === 1);
         document.getElementById('player2-info').classList.toggle('active', this.currentPlayer === 2);
         
-        document.getElementById('p1-figures').textContent = this.countFigures(1);
-        document.getElementById('p2-figures').textContent = this.countFigures(2);
+        const p1Figures = document.getElementById('p1-figures');
+        const p2Figures = document.getElementById('p2-figures');
+        if (p1Figures) p1Figures.textContent = String(this.countFigures(1));
+        if (p2Figures) p2Figures.textContent = String(this.countFigures(2));
     }
 }
 
-const startButton = document.getElementById('start-game');
-const landing = document.getElementById('landing');
-const gameUi = document.getElementById('game-ui');
-const authEmailInput = document.getElementById('auth-email');
-const authPasswordInput = document.getElementById('auth-password');
-const authLoginButton = document.getElementById('auth-login');
-const authRegisterButton = document.getElementById('auth-register');
-const authLogoutButton = document.getElementById('auth-logout');
-const authStatus = document.getElementById('auth-status');
-const lobbyCodeInput = document.getElementById('lobby-code');
-const createLobbyButton = document.getElementById('create-lobby');
-const joinLobbyButton = document.getElementById('join-lobby');
-const refreshLobbiesButton = document.getElementById('refresh-lobbies');
-const readyLobbyButton = document.getElementById('lobby-ready');
-const readyStatus = document.getElementById('ready-status');
-const lobbyStatus = document.getElementById('lobby-status');
-const lobbyInfo = document.getElementById('lobby-info');
-const turnTimer = document.getElementById('turn-timer');
-const lobbyList = document.getElementById('lobby-list');
+const startButton = document.getElementById('start-game') as HTMLButtonElement;
+const landing = document.getElementById('landing') as HTMLElement;
+const gameUi = document.getElementById('game-ui') as HTMLElement;
+const authEmailInput = document.getElementById('auth-email') as HTMLInputElement;
+const authPasswordInput = document.getElementById('auth-password') as HTMLInputElement;
+const authLoginButton = document.getElementById('auth-login') as HTMLButtonElement;
+const authRegisterButton = document.getElementById('auth-register') as HTMLButtonElement;
+const authLogoutButton = document.getElementById('auth-logout') as HTMLButtonElement;
+const authStatus = document.getElementById('auth-status') as HTMLElement;
+const lobbyCodeInput = document.getElementById('lobby-code') as HTMLInputElement;
+const createLobbyButton = document.getElementById('create-lobby') as HTMLButtonElement;
+const joinLobbyButton = document.getElementById('join-lobby') as HTMLButtonElement;
+const refreshLobbiesButton = document.getElementById('refresh-lobbies') as HTMLButtonElement;
+const readyLobbyButton = document.getElementById('lobby-ready') as HTMLButtonElement;
+const readyStatus = document.getElementById('ready-status') as HTMLElement;
+const lobbyStatus = document.getElementById('lobby-status') as HTMLElement;
+const lobbyInfo = document.getElementById('lobby-info') as HTMLElement;
+const turnTimer = document.getElementById('turn-timer') as HTMLElement;
+const lobbyList = document.getElementById('lobby-list') as HTMLElement;
 
 const SUPABASE_URL = 'https://gxcwaufhbmygixnssifv.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imd4Y3dhdWZoYm15Z2l4bnNzaWZ2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk3ODc0NjYsImV4cCI6MjA4NTM2MzQ2Nn0.gl2Q-PZ83shdlsTht6khPiy4p_2GVl_-shkCU_XzEIk';
@@ -962,9 +997,9 @@ let readyPlayers = new Set();
 let localReady = false;
 let broadcastReady = false;
 let rpcHelper = null;
-const xn = (s) => {
-    const fetchFn = s || fetch;
-    return async (input, init = {}) => {
+const xn = (s: typeof fetch = fetch) => {
+    const fetchFn = s;
+    return async (input: RequestInfo | URL, init: RequestInit = {}) => {
         const headers = new Headers(init.headers || {});
         if (init.body !== undefined && !headers.has('Content-Type')) {
             headers.set('Content-Type', 'application/json');
@@ -1082,7 +1117,7 @@ function initRpcHelper(supabase) {
         }
         const { data, error, status } = await supabase.rpc(name, params);
         if (error) {
-            const err = new Error(error.message || 'rpc error');
+            const err: any = new Error(error.message || 'rpc error');
             err.details = error;
             err.status = status;
             throw err;
@@ -1090,7 +1125,7 @@ function initRpcHelper(supabase) {
         return data;
     }
 
-    async function rpcJoinLobby({ lobby_code, player_id } = {}) {
+    async function rpcJoinLobby({ lobby_code, player_id }: any = {}) {
         if (!lobby_code || typeof lobby_code !== 'string') {
             throw new TypeError('lobby_code (string) is required');
         }
@@ -1109,7 +1144,7 @@ function initRpcHelper(supabase) {
         }
     }
 
-    async function rpcApplyCommand({ lobby_code, player_id, action, payload } = {}) {
+    async function rpcApplyCommand({ lobby_code, player_id, action, payload }: any = {}) {
         if (!lobby_code || typeof lobby_code !== 'string') {
             throw new TypeError('lobby_code (string) is required');
         }
@@ -1136,7 +1171,7 @@ function initRpcHelper(supabase) {
         });
     }
 
-    async function rpcApplyCommandJson({ lobby_code, player_id, action, payload } = {}) {
+    async function rpcApplyCommandJson({ lobby_code, player_id, action, payload }: any = {}) {
         if (!lobby_code || typeof lobby_code !== 'string') {
             throw new TypeError('lobby_code (string) is required');
         }
@@ -1488,7 +1523,7 @@ function sendCommand(action, payload) {
                             player_id: playerId,
                             action,
                             payload: payload ?? {}
-                        }
+                        } as any
                     }).then((resp) => {
                         if (resp.ok) return;
                         return rpcHelper
