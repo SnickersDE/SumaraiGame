@@ -986,6 +986,7 @@ const PLAYER_SIDE_KEY = 'myapp_player_side_v1';
 
 let game = null;
 let lobbyCode = null;
+let lobbyId = null;
 let playerId = null;
 let playerIndex = null;
 let turnTimerInterval = null;
@@ -1089,6 +1090,10 @@ function getOrCreatePlayerSide() {
 
 function updateLobbyInfo() {
     lobbyInfo.textContent = lobbyCode ? `Lobby ${lobbyCode} • Spieler ${playerIndex}` : '';
+}
+
+function getLobbyChannelKey() {
+    return lobbyId || lobbyCode;
 }
 
 function applySupabaseInputs() {
@@ -1211,6 +1216,10 @@ function initRpcHelper(supabase) {
 
 function updateAuthUi(session) {
     authSession = session;
+    const client = supabaseClient || applySupabaseInputs();
+    if (client && session?.access_token) {
+        client.realtime.setAuth(session.access_token);
+    }
     if (session?.user?.email) {
         authStatus.textContent = `Angemeldet: ${session.user.email}`;
         authLoginButton.disabled = true;
@@ -1285,6 +1294,7 @@ function returnToLanding() {
     landing.style.display = 'flex';
     gameUi.classList.remove('active');
     lobbyCode = null;
+    lobbyId = null;
     playerId = null;
     playerIndex = null;
     resetReadyState();
@@ -1362,11 +1372,17 @@ function subscribeSupabaseBroadcast(lobbyCodeValue) {
     if (supabaseBroadcastChannel) {
         supabaseBroadcastChannel.unsubscribe();
     }
-    supabaseBroadcastChannel = client.channel(`lobby:${lobbyCodeValue}:players`, { config: { private: true } });
+    if (authSession?.access_token) {
+        client.realtime.setAuth(authSession.access_token);
+    }
+    const channelKey = getLobbyChannelKey() || lobbyCodeValue;
+    supabaseBroadcastChannel = client.channel(`lobby:${channelKey}:players`, { config: { private: true } });
     broadcastReady = false;
     supabaseBroadcastChannel.on('broadcast', { event: 'INSERT' }, () => {
         setLobbyStatus('Neuer Spieler beigetreten');
     });
+    supabaseBroadcastChannel.on('broadcast', { event: 'UPDATE' }, () => {});
+    supabaseBroadcastChannel.on('broadcast', { event: 'DELETE' }, () => {});
     supabaseBroadcastChannel.on('broadcast', { event: 'player_message' }, (payload) => {
         if (payload?.payload?.text) {
             setLobbyStatus(payload.payload.text);
@@ -1403,6 +1419,9 @@ function subscribeLobbyState(lobbyCodeValue) {
     if (!client || !lobbyCodeValue) return;
     if (supabaseStateChannel) {
         supabaseStateChannel.unsubscribe();
+    }
+    if (authSession?.access_token) {
+        client.realtime.setAuth(authSession.access_token);
     }
     supabaseStateChannel = client.channel(`lobby-state:${lobbyCodeValue}`);
     supabaseStateChannel.on(
@@ -1559,6 +1578,7 @@ async function createLobby() {
         return;
     }
     lobbyCode = data.lobby_code;
+    lobbyId = data.lobby_id || null;
     playerId = data.player_id;
     playerIndex = data.player_index;
     persistPlayerId(playerId);
@@ -1605,6 +1625,7 @@ async function joinLobby() {
         return;
     }
     lobbyCode = data.lobby_code;
+    lobbyId = data.lobby_id || null;
     playerId = data.player_id;
     playerIndex = data.player_index;
     if (playerId && playerId !== getCachedPlayerId()) {
