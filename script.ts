@@ -1098,7 +1098,7 @@ function getLobbyChannelKey() {
 
 function applySupabaseInputs() {
     const url = SUPABASE_URL;
-    const key = SUPABASE_PUBLISHABLE_KEY || SUPABASE_ANON_KEY;
+    const key = SUPABASE_ANON_KEY;
     if (!url || !key) {
         supabaseClient = null;
         rpcHelper = null;
@@ -1535,7 +1535,7 @@ function sendCommand(action, payload) {
                     return fetchWithJson(url, {
                         method: 'POST',
                         headers: {
-                            apikey: SUPABASE_PUBLISHABLE_KEY || SUPABASE_ANON_KEY,
+                            apikey: SUPABASE_ANON_KEY,
                             Authorization: `Bearer ${accessToken}`
                         },
                         body: {
