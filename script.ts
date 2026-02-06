@@ -25,6 +25,7 @@ class Game {
     lobbyReady;
     startAnimationShown;
     onGameEnd;
+    movePending;
     constructor(options: any = {}) {
         this.board = Array(6).fill(null).map(() => Array(7).fill(null));
         this.currentPlayer = 1;
@@ -46,6 +47,7 @@ class Game {
         this.lobbyReady = false;
         this.startAnimationShown = false;
         this.onGameEnd = options.onGameEnd ?? null;
+        this.movePending = false;
         if (!this.multiplayer) {
             this.startSetupPhase();
         }
@@ -431,7 +433,11 @@ class Game {
     handleCellClick(row, col) {
         if (this.gameOver || this.setupPhase) return;
         if (this.animationLock) return;
-        if (this.multiplayer && this.viewerPlayer !== this.currentPlayer) return;
+        if (this.movePending) return;
+        if (this.multiplayer && this.viewerPlayer !== this.currentPlayer) {
+            setLobbyStatus('Nicht dein Zug');
+            return;
+        }
 
         const cell = this.board[row][col];
 
@@ -474,7 +480,12 @@ class Game {
         if (this.animationLock) return;
         if (this.multiplayer) {
             this.selectedCell = null;
-            this.sendCommand?.('move', { fromRow, fromCol, toRow, toCol });
+            this.movePending = true;
+            Promise.resolve(this.sendCommand?.('move', { fromRow, fromCol, toRow, toCol }))
+                .catch(() => {})
+                .finally(() => {
+                    this.movePending = false;
+                });
             this.render();
             return;
         }
@@ -994,6 +1005,7 @@ let lobbyListInterval = null;
 let supabaseClient = null;
 let supabaseBroadcastChannel = null;
 let supabaseStateChannel = null;
+let supabaseEventsChannel = null;
 let authSession = null;
 let readyPlayers = new Set();
 let localReady = false;
@@ -1096,6 +1108,11 @@ function getLobbyChannelKey() {
     return lobbyId || lobbyCode;
 }
 
+function setGameplayUiActive(active) {
+    if (!gameUi) return;
+    gameUi.classList.toggle('playing', Boolean(active));
+}
+
 function applySupabaseInputs() {
     const url = SUPABASE_URL;
     const key = SUPABASE_ANON_KEY;
@@ -1196,7 +1213,7 @@ function initRpcHelper(supabase) {
         } catch {
             throw new TypeError('payload must be JSON-serializable');
         }
-        return callRpc('apply_command_json', {
+        return callRpc('apply_command_guard', {
             payload: {
                 lobby_code,
                 player_id,
@@ -1259,7 +1276,76 @@ function updateReadyStatus() {
     readyStatus.textContent = localReady ? 'Du bist bereit' : 'Warte auf zweiten Spieler';
 }
 
-function handleReadyClick() {
+async function createLobbyEvent(eventType, payload) {
+    if (!rpcHelper || !lobbyId || !playerId) return false;
+    try {
+        await rpcHelper.callRpc('create_lobby_event', {
+            p_lobby_id: lobbyId,
+            p_player_id: playerId,
+            p_event_type: eventType,
+            p_payload: payload ?? {}
+        });
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function sendLobbyBroadcast(event, payload) {
+    if (!supabaseBroadcastChannel) return;
+    const message = {
+        type: 'broadcast',
+        event,
+        payload
+    };
+    if (typeof supabaseBroadcastChannel.httpSend === 'function') {
+        supabaseBroadcastChannel.httpSend(message.event, message.payload);
+    } else {
+        supabaseBroadcastChannel.send(message);
+    }
+}
+
+async function sendLobbyEvent(event, payload) {
+    const ok = await createLobbyEvent(event, payload);
+    if (!ok) {
+        sendLobbyBroadcast(event, payload);
+    }
+}
+
+function handleLobbyEvent(eventRow) {
+    const eventType = eventRow?.event_type;
+    const payload = eventRow?.payload || {};
+    if (eventType === 'player_ready') {
+        const readyId = payload.player_id;
+        if (!readyId) return;
+        if (payload.ready) {
+            readyPlayers.add(readyId);
+        } else {
+            readyPlayers.delete(readyId);
+        }
+        updateReadyStatus();
+        if (readyPlayers.size >= 2 && game) {
+            game.setLobbyReady(true);
+        }
+        return;
+    }
+    if (eventType === 'player_message') {
+        if (payload.text) {
+            setLobbyStatus(payload.text);
+        }
+        return;
+    }
+    if (eventType === 'player_joined') {
+        const text = payload.text || 'Neuer Spieler beigetreten';
+        setLobbyStatus(text);
+        return;
+    }
+    if (eventType === 'game_started') {
+        setGameplayUiActive(true);
+    }
+}
+
+async function handleReadyClick() {
     if (!lobbyCode || !supabaseBroadcastChannel) return;
     if (!broadcastReady) {
         setLobbyStatus('Verbindung wird aufgebaut...');
@@ -1269,16 +1355,15 @@ function handleReadyClick() {
     localReady = true;
     readyPlayers.add(playerId);
     updateReadyStatus();
-    const message = {
-        type: 'broadcast',
-        event: 'player_ready',
-        payload: { playerId }
-    };
-    if (typeof supabaseBroadcastChannel.httpSend === 'function') {
-        supabaseBroadcastChannel.httpSend(message.event, message.payload);
-    } else {
-        supabaseBroadcastChannel.send(message);
-    }
+    sendLobbyEvent('player_ready', {
+        lobby_id: lobbyId,
+        lobby_code: lobbyCode,
+        player_id: playerId,
+        player_index: playerIndex,
+        side: getCachedPlayerSide(),
+        ready: true,
+        ts: new Date().toISOString()
+    });
     if (readyPlayers.size >= 2 && game) {
         game.setLobbyReady(true);
     }
@@ -1298,11 +1383,16 @@ function returnToLanding() {
     playerId = null;
     playerIndex = null;
     resetReadyState();
+    setGameplayUiActive(false);
     setLobbyStatus('Nicht verbunden');
     updateLobbyInfo();
     if (supabaseBroadcastChannel) {
         supabaseBroadcastChannel.unsubscribe();
         supabaseBroadcastChannel = null;
+    }
+    if (supabaseEventsChannel) {
+        supabaseEventsChannel.unsubscribe();
+        supabaseEventsChannel = null;
     }
     if (supabaseStateChannel) {
         supabaseStateChannel.unsubscribe();
@@ -1378,11 +1468,12 @@ function subscribeSupabaseBroadcast(lobbyCodeValue) {
     const channelKey = getLobbyChannelKey() || lobbyCodeValue;
     supabaseBroadcastChannel = client.channel(`lobby:${channelKey}:players`, { config: { private: true } });
     broadcastReady = false;
-    supabaseBroadcastChannel.on('broadcast', { event: 'INSERT' }, () => {
-        setLobbyStatus('Neuer Spieler beigetreten');
+    supabaseBroadcastChannel.on('broadcast', { event: 'player_joined' }, (payload) => {
+        const text = payload?.payload?.text || 'Neuer Spieler beigetreten';
+        setLobbyStatus(text);
     });
-    supabaseBroadcastChannel.on('broadcast', { event: 'UPDATE' }, () => {});
-    supabaseBroadcastChannel.on('broadcast', { event: 'DELETE' }, () => {});
+    supabaseBroadcastChannel.on('broadcast', { event: 'game_created' }, () => {});
+    supabaseBroadcastChannel.on('broadcast', { event: 'game_updated' }, () => {});
     supabaseBroadcastChannel.on('broadcast', { event: 'player_message' }, (payload) => {
         if (payload?.payload?.text) {
             setLobbyStatus(payload.payload.text);
@@ -1400,18 +1491,39 @@ function subscribeSupabaseBroadcast(lobbyCodeValue) {
     supabaseBroadcastChannel.subscribe((status) => {
         if (status === 'SUBSCRIBED') {
             broadcastReady = true;
-            const message = {
-                type: 'broadcast',
-                event: 'player_message',
-                payload: { text: 'Hi' }
-            };
-            if (typeof supabaseBroadcastChannel.httpSend === 'function') {
-                supabaseBroadcastChannel.httpSend(message.event, message.payload);
-            } else {
-                supabaseBroadcastChannel.send(message);
-            }
+            sendLobbyEvent('player_joined', {
+                lobby_id: lobbyId,
+                lobby_code: lobbyCodeValue,
+                player_id: playerId,
+                player_index: playerIndex,
+                side: getCachedPlayerSide(),
+                text: 'Spieler beigetreten',
+                ts: new Date().toISOString()
+            });
         }
     });
+}
+
+function subscribeLobbyEvents(lobbyIdValue) {
+    const client = supabaseClient || applySupabaseInputs();
+    if (!client || !lobbyIdValue) return;
+    if (supabaseEventsChannel) {
+        supabaseEventsChannel.unsubscribe();
+    }
+    if (authSession?.access_token) {
+        client.realtime.setAuth(authSession.access_token);
+    }
+    supabaseEventsChannel = client.channel(`lobby-events:${lobbyIdValue}`);
+    supabaseEventsChannel.on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'lobby_events', filter: `lobby_id=eq.${lobbyIdValue}` },
+        (payload) => {
+            if (payload?.new) {
+                handleLobbyEvent(payload.new);
+            }
+        }
+    );
+    supabaseEventsChannel.subscribe();
 }
 
 function subscribeLobbyState(lobbyCodeValue) {
@@ -1430,6 +1542,7 @@ function subscribeLobbyState(lobbyCodeValue) {
         (payload) => {
             const state = payload.new?.state;
             const status = payload.new?.status;
+            setGameplayUiActive(status === 'active');
             if (status === 'waiting') {
                 resetReadyState();
                 if (game) {
@@ -1523,15 +1636,15 @@ function updateTurnTimer(state) {
 function sendCommand(action, payload) {
     const client = supabaseClient || applySupabaseInputs();
     if (!client || !lobbyCode || !playerId || !rpcHelper) return;
-    rpcHelper
+    return rpcHelper
         .rpcApplyCommandJson({ lobby_code: lobbyCode, player_id: playerId, action, payload })
         .catch((error) => {
             const message = error?.details?.message || error.message || '';
-            if (message.includes('apply_command_json') || message.includes('function') || error.status === 404) {
+            if (message.includes('apply_command_guard') || message.includes('apply_command_json') || message.includes('function') || error.status === 404) {
                 const accessToken = authSession?.access_token;
                 if (accessToken) {
                     const fetchWithJson = xn();
-                    const url = `${SUPABASE_URL}/rest/v1/rpc/apply_command_json`;
+                    const url = `${SUPABASE_URL}/rest/v1/rpc/apply_command_guard`;
                     return fetchWithJson(url, {
                         method: 'POST',
                         headers: {
@@ -1581,11 +1694,15 @@ async function createLobby() {
     lobbyId = data.lobby_id || null;
     playerId = data.player_id;
     playerIndex = data.player_index;
+    if (data.player_side) {
+        persistPlayerSide(data.player_side);
+    }
     persistPlayerId(playerId);
     lobbyCodeInput.value = lobbyCode;
     updateLobbyInfo();
     resetReadyState();
     subscribeSupabaseBroadcast(lobbyCode);
+    subscribeLobbyEvents(lobbyId);
     subscribeLobbyState(lobbyCode);
     if (data.state) {
         game = new Game({ multiplayer: true, viewerPlayer: playerIndex, sendCommand, onGameEnd: handleGameEnd });
@@ -1628,12 +1745,16 @@ async function joinLobby() {
     lobbyId = data.lobby_id || null;
     playerId = data.player_id;
     playerIndex = data.player_index;
+    if (data.player_side) {
+        persistPlayerSide(data.player_side);
+    }
     if (playerId && playerId !== getCachedPlayerId()) {
         persistPlayerId(playerId);
     }
     updateLobbyInfo();
     resetReadyState();
     subscribeSupabaseBroadcast(lobbyCode);
+    subscribeLobbyEvents(lobbyId);
     subscribeLobbyState(lobbyCode);
     if (data.state) {
         game = new Game({ multiplayer: true, viewerPlayer: playerIndex, sendCommand, onGameEnd: handleGameEnd });

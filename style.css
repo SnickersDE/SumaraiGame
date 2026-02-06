@@ -531,6 +531,12 @@ h1 {
     content: '▴';
 }
 
+.game-ui.playing .auth-panel,
+.game-ui.playing .lobby-panel,
+.game-ui.playing .rules-panel {
+    display: none;
+}
+
 .legend-item {
     display: flex;
     align-items: center;
