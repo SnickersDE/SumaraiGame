@@ -1,4 +1,5 @@
 import { createClient } from '@supabase/supabase-js';
+import { joinLobby as joinLobbyRpc } from './joinLobby';
 
 const SYMBOLS = {
     e: ''
@@ -1728,14 +1729,16 @@ async function joinLobby() {
     try {
         const cachedPlayerId = getCachedPlayerId();
         const side = getOrCreatePlayerSide();
-        if (cachedPlayerId) {
-            try {
-                data = await rpcHelper.callRpc('join_lobby', { p_code: code, p_player_id: cachedPlayerId, p_side: side });
-            } catch {
-                data = await rpcHelper.callRpc('join_lobby', { p_code: code, p_side: side });
-            }
-        } else {
-            data = await rpcHelper.callRpc('join_lobby', { p_code: code, p_side: side });
+        let result = await joinLobbyRpc(client, code, side, cachedPlayerId ?? null);
+        if (result.error && cachedPlayerId) {
+            result = await joinLobbyRpc(client, code, side, null);
+        }
+        if (result.error) {
+            throw result.error;
+        }
+        data = result.data;
+        if (!data) {
+            throw new Error('Lobby konnte nicht beigetreten werden');
         }
     } catch (error) {
         setLobbyStatus(formatSupabaseError(error, 'Lobby konnte nicht beigetreten werden'));

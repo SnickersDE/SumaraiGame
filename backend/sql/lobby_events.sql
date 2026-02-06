@@ -1,5 +1,7 @@
 create extension if not exists pgcrypto;
 
+drop function if exists public.join_lobby(text, text);
+
 create table if not exists public.lobby_members (
     id uuid primary key default gen_random_uuid(),
     lobby_id uuid not null references public.lobbies(id) on delete cascade,
